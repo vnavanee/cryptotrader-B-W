@@ -339,132 +339,481 @@ function _backoffMs(attempt) {
   return Math.floor(Math.random() * exp);
 }
 
-// ─── CDP JWT Auth ─────────────────────────────────────────────────────────────
-async function importCBKey(pemPrivate) {
-  const b64 = pemPrivate.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
-  const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  return crypto.subtle.importKey("pkcs8", der, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXCHANGE ADAPTER LAYER
+// Each adapter exposes the same interface:
+//   getBalances(keys)   → { USD, BTC, ETH, SOL }
+//   placeOrder(keys, productId, side, quoteSize, baseSize) → { orderId }
+//   getMarketData(keys, productIds[]) → { BTC: {price,bid,ask}, ... }
+//
+// All adapters use the shared rate-limiter + exponential backoff via rateFetch().
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Exchange provider registry ───────────────────────────────────────────────
+const EXCHANGE_PROVIDERS = {
+  coinbase: {
+    id: "coinbase",
+    name: "Coinbase Advanced Trade",
+    logo: "🔵",
+    color: "#1652f0",
+    docsUrl: "https://docs.cdp.coinbase.com/advanced-trade/docs/getting-started",
+    credFields: [
+      { key: "apiKeyName",  label: "API Key Name",       placeholder: "organizations/xxx/apiKeys/yyy", type: "text",     hint: "From cdp.coinbase.com → API Keys" },
+      { key: "privateKey",  label: "EC Private Key (PEM)", placeholder: "-----BEGIN EC PRIVATE KEY-----", type: "pem",  hint: "EC P-256 key, keep secret" },
+    ],
+    productId: (coin) => `${coin}-USD`,
+    rateLimit: { read: 600, write: 500, windowMs: 10_000 },
+  },
+  binance: {
+    id: "binance",
+    name: "Binance.US",
+    logo: "🟡",
+    color: "#f0b90b",
+    docsUrl: "https://docs.binance.us",
+    credFields: [
+      { key: "apiKey",    label: "API Key",    placeholder: "Your Binance.US API key",    type: "text",     hint: "From binance.us → API Management" },
+      { key: "secretKey", label: "Secret Key", placeholder: "Your Binance.US secret key", type: "password", hint: "Never share this key" },
+    ],
+    productId: (coin) => `${coin}USDT`,
+    rateLimit: { read: 1200, write: 100, windowMs: 60_000 },
+  },
+  kraken: {
+    id: "kraken",
+    name: "Kraken",
+    logo: "🐙",
+    color: "#5741d9",
+    docsUrl: "https://docs.kraken.com/rest",
+    credFields: [
+      { key: "apiKey",      label: "API Key",      placeholder: "Your Kraken API key",      type: "text",     hint: "From kraken.com → Security → API" },
+      { key: "privateKey",  label: "Private Key",  placeholder: "Your Kraken private key",  type: "password", hint: "Base64-encoded private key" },
+    ],
+    productId: (coin) => `${coin === "BTC" ? "XBT" : coin}USD`,
+    rateLimit: { read: 15, write: 15, windowMs: 3_000 },
+  },
+  gemini: {
+    id: "gemini",
+    name: "Gemini",
+    logo: "♊",
+    color: "#00dcfa",
+    docsUrl: "https://docs.gemini.com/rest-api",
+    credFields: [
+      { key: "apiKey",    label: "API Key",    placeholder: "Your Gemini API key",    type: "text",     hint: "From gemini.com → Settings → API" },
+      { key: "secretKey", label: "API Secret", placeholder: "Your Gemini API secret", type: "password", hint: "Keep this private" },
+    ],
+    productId: (coin) => `${coin}USD`.toLowerCase(),
+    rateLimit: { read: 120, write: 60, windowMs: 60_000 },
+  },
+  alpaca: {
+    id: "alpaca",
+    name: "Alpaca",
+    logo: "🦙",
+    color: "#ffcf47",
+    docsUrl: "https://docs.alpaca.markets/reference/getallcryptobars",
+    credFields: [
+      { key: "apiKey",    label: "API Key ID",  placeholder: "Your Alpaca API key ID",  type: "text",     hint: "From alpaca.markets → API Keys" },
+      { key: "secretKey", label: "Secret Key",  placeholder: "Your Alpaca secret key",  type: "password", hint: "Keep this private" },
+    ],
+    productId: (coin) => `${coin}/USD`,
+    rateLimit: { read: 200, write: 200, windowMs: 60_000 },
+  },
+  public: {
+    id: "public",
+    name: "Public.com",
+    logo: "🟢",
+    color: "#3fba71",
+    docsUrl: "https://public.com/api",
+    credFields: [
+      { key: "apiKey",    label: "API Key",    placeholder: "Your Public.com API key",    type: "text",     hint: "From public.com → Settings → API" },
+      { key: "secretKey", label: "API Secret", placeholder: "Your Public.com API secret", type: "password", hint: "Keep this private" },
+    ],
+    productId: (coin) => `${coin}-USD`,
+    rateLimit: { read: 100, write: 60, windowMs: 60_000 },
+  },
+};
+
+// ─── Shared rate-limiter (per-provider buckets, keyed by providerId:bucket) ───
+const _rlBuckets = {};
+function _getRLBucket(providerId, bucket) {
+  const key = `${providerId}:${bucket}`;
+  if (!_rlBuckets[key]) _rlBuckets[key] = { timestamps: [] };
+  return _rlBuckets[key];
 }
-async function buildCBJWT(apiKeyName, privateKeyPem, method, path) {
-  const now = Math.floor(Date.now() / 1000);
-  const uri = `${method} api.coinbase.com${path}`;
-  const header = { alg: "ES256", kid: apiKeyName };
-  const payload = { iss: "cdp", nbf: now, exp: now + 120, sub: apiKeyName, uri };
-  const enc = (obj) => btoa(JSON.stringify(obj)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-  const signing = `${enc(header)}.${enc(payload)}`;
-  const key = await importCBKey(privateKeyPem);
-  const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(signing));
-  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-  return `${signing}.${sigB64}`;
+function _rlWaitMs(providerId, bucket, limit, windowMs) {
+  const b = _getRLBucket(providerId, bucket);
+  const cutoff = Date.now() - windowMs;
+  b.timestamps = b.timestamps.filter((t) => t > cutoff);
+  if (b.timestamps.length < limit) return 0;
+  return Math.max(0, b.timestamps[0] + windowMs - Date.now() + 5);
+}
+function _rlRecord(providerId, bucket) {
+  _getRLBucket(providerId, bucket).timestamps.push(Date.now());
 }
 
-// ─── Core rate-limited fetch with exponential backoff ────────────────────────
-// bucket: "READ" | "WRITE"
-async function cbFetch(creds, method, path, body, _attempt = 0) {
-  const bucket = method === "GET" ? "READ" : "WRITE";
+// Global retry/throttle stats (used by RateLimitMonitor)
+const _rl = {
+  READ:  { timestamps: [] }, WRITE: { timestamps: [] },
+  stats: { readUsed: 0, writeUsed: 0, readQueued: 0, writeQueued: 0, retries: 0, throttled: 0, lastError: null },
+};
+function _pruneWindow(bucket) {
+  const cutoff = Date.now() - RATE_LIMITS[bucket].windowMs;
+  _rl[bucket].timestamps = _rl[bucket].timestamps.filter((t) => t > cutoff);
+}
+function _windowUsed(bucket) { _pruneWindow(bucket); return _rl[bucket].timestamps.length; }
+function _waitMs(bucket) {
+  _pruneWindow(bucket);
+  const { timestamps } = _rl[bucket];
+  const { max, windowMs } = RATE_LIMITS[bucket];
+  if (timestamps.length < max) return 0;
+  return Math.max(0, timestamps[0] + windowMs - Date.now() + 5);
+}
+function _recordCall(bucket) { _rl[bucket].timestamps.push(Date.now()); }
 
-  // 1. Rate-limit gate — wait until a slot opens
-  const wait = _waitMs(bucket);
-  if (wait > 0) {
-    _rl.stats.throttled++;
-    _rl.stats[bucket === "READ" ? "readQueued" : "writeQueued"]++;
-    await _sleep(wait);
-    _rl.stats[bucket === "READ" ? "readQueued" : "writeQueued"]--;
-  }
+// ─── Generic rate-limited fetch with exponential backoff ──────────────────────
+async function rateFetch(url, options = {}, providerId = "coinbase", bucket = "READ", _attempt = 0) {
+  const provider = EXCHANGE_PROVIDERS[providerId];
+  const { read, write, windowMs } = provider?.rateLimit || { read: 600, write: 500, windowMs: 10_000 };
+  const limit = bucket === "READ" ? read : write;
 
-  // 2. Record the call and build JWT
-  _recordCall(bucket);
-  _rl.stats[bucket === "READ" ? "readUsed" : "writeUsed"] = _windowUsed(bucket);
+  const wait = _rlWaitMs(providerId, bucket, limit, windowMs);
+  if (wait > 0) { _rl.stats.throttled++; await _sleep(wait); }
+  _rlRecord(providerId, bucket);
 
-  const jwt = await buildCBJWT(creds.apiKeyName, creds.privateKey, method, path);
-
-  // 3. Fire the request
   let res, data;
   try {
-    res = await fetch(`${CB_API_BASE}${path}`, {
-      method,
-      headers: { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    data = await res.json();
+    res = await fetch(url, options);
+    const text = await res.text();
+    try { data = JSON.parse(text); } catch { data = text; }
   } catch (networkErr) {
-    // Network-level failure — retry with backoff
     if (_attempt < MAX_RETRIES) {
       const delay = _backoffMs(_attempt);
       _rl.stats.retries++;
-      _rl.stats.lastError = `Network error, retry ${_attempt + 1} in ${delay}ms`;
+      _rl.stats.lastError = `[${providerId}] Network error, retry ${_attempt + 1}`;
       await _sleep(delay);
-      return cbFetch(creds, method, path, body, _attempt + 1);
+      return rateFetch(url, options, providerId, bucket, _attempt + 1);
     }
     throw networkErr;
   }
 
-  // 4. Handle HTTP errors
-  if (res.status === 429) {
-    // Respect Retry-After header if present, otherwise use backoff
-    const retryAfter = parseInt(res.headers?.get?.("Retry-After") || "0", 10);
-    const delay = retryAfter > 0 ? retryAfter * 1000 : _backoffMs(_attempt);
-    if (_attempt < MAX_RETRIES) {
-      _rl.stats.retries++;
-      _rl.stats.lastError = `429 rate limited, retry ${_attempt + 1} in ${Math.round(delay / 1000)}s`;
-      await _sleep(delay);
-      return cbFetch(creds, method, path, body, _attempt + 1);
-    }
-    throw new Error("Rate limit exceeded after max retries");
-  }
-
-  if (res.status >= 500 && _attempt < MAX_RETRIES) {
-    const delay = _backoffMs(_attempt);
+  if (res.status === 429 && _attempt < MAX_RETRIES) {
+    const delay = parseInt(res.headers?.get?.("Retry-After") || "0") * 1000 || _backoffMs(_attempt);
     _rl.stats.retries++;
-    _rl.stats.lastError = `HTTP ${res.status}, retry ${_attempt + 1} in ${delay}ms`;
+    _rl.stats.lastError = `[${providerId}] 429 rate limited, retry ${_attempt + 1}`;
     await _sleep(delay);
-    return cbFetch(creds, method, path, body, _attempt + 1);
+    return rateFetch(url, options, providerId, bucket, _attempt + 1);
   }
-
+  if (res.status >= 500 && _attempt < MAX_RETRIES) {
+    _rl.stats.retries++;
+    await _sleep(_backoffMs(_attempt));
+    return rateFetch(url, options, providerId, bucket, _attempt + 1);
+  }
   if (!res.ok) {
-    const msg = data?.message || data?.error || data?.preview_failure_reason || `HTTP ${res.status}`;
-    _rl.stats.lastError = msg;
-    throw new Error(msg);
+    const msg = (typeof data === "object" ? data?.message || data?.error || data?.msg : data) || `HTTP ${res.status}`;
+    _rl.stats.lastError = `[${providerId}] ${msg}`;
+    throw new Error(`[${providerId}] ${msg}`);
   }
-
   _rl.stats.lastError = null;
   return data;
 }
 
-// ─── High-level API calls ────────────────────────────────────────────────────
-async function cbGetPrice(creds, productId) {
-  const data = await cbFetch(creds, "GET", `/best_bid_ask?product_ids=${productId}`);
-  const entry = data.pricebooks?.[0];
-  if (!entry) throw new Error("No price data");
-  return parseFloat(entry.asks?.[0]?.price || entry.bids?.[0]?.price);
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Coinbase Advanced Trade adapter ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+async function importCBKey(pem) {
+  const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey("pkcs8", der, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
 }
-async function cbGetAccounts(creds) {
-  // Single call fetches all accounts — avoids duplicate GET /accounts per currency
-  return cbFetch(creds, "GET", "/accounts");
+async function buildCBJWT(apiKeyName, pem, method, path) {
+  const now = Math.floor(Date.now() / 1000);
+  const enc = (obj) => btoa(JSON.stringify(obj)).replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_");
+  const signing = `${enc({ alg:"ES256", kid:apiKeyName })}.${enc({ iss:"cdp", nbf:now, exp:now+120, sub:apiKeyName, uri:`${method} api.coinbase.com${path}` })}`;
+  const key = await importCBKey(pem);
+  const sig = await crypto.subtle.sign({ name:"ECDSA", hash:"SHA-256" }, key, new TextEncoder().encode(signing));
+  return `${signing}.${btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g,"").replace(/\+/g,"-").replace(/\//g,"_")}`;
 }
-async function cbGetCandles(creds, productId, granularity = "ONE_MINUTE") {
-  const end = Math.floor(Date.now() / 1000);
-  const start = end - 60 * 60; // last 60 minutes
-  return cbFetch(creds, "GET", `/products/${productId}/candles?start=${start}&end=${end}&granularity=${granularity}`);
+async function cbRequest(keys, method, path, body) {
+  const jwt = await buildCBJWT(keys.apiKeyName, keys.privateKey, method, path);
+  return rateFetch(`${CB_API_BASE}${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  }, "coinbase", method === "GET" ? "READ" : "WRITE");
 }
-async function cbGetOrderBook(creds, productId) {
-  return cbFetch(creds, "GET", `/product_book?product_id=${productId}&limit=5`);
+const coinbaseAdapter = {
+  async getBalances(keys) {
+    const data = await cbRequest(keys, "GET", "/accounts");
+    const balances = { USD: 0 };
+    for (const acc of data.accounts || []) {
+      const v = parseFloat(acc.available_balance?.value || 0);
+      if (acc.currency === "USD") balances.USD = v;
+      else if (COINS.includes(acc.currency)) balances[acc.currency] = v;
+    }
+    try {
+      const fills = await cbRequest(keys, "GET", `/orders/historical/fills?product_id=BTC-USD&limit=5`);
+      balances._recentFills = fills.fills?.slice(0, 5) || [];
+    } catch (_) {}
+    return balances;
+  },
+  async placeOrder(keys, productId, side, quoteSize, baseSize) {
+    const result = await cbRequest(keys, "POST", "/orders", {
+      client_order_id: `algo-${Date.now()}-${Math.random().toString(36).slice(2,7)}`,
+      product_id: productId,
+      side,
+      order_configuration: side === "BUY"
+        ? { market_market_ioc: { quote_size: quoteSize.toFixed(2) } }
+        : { market_market_ioc: { base_size: baseSize.toFixed(8) } },
+    });
+    return { orderId: result.order_id, raw: result };
+  },
+  async getMarketData(keys, productIds) {
+    const data = await cbRequest(keys, "GET", `/best_bid_ask?product_ids=${productIds.join("&product_ids=")}`);
+    const out = {};
+    for (const pb of data.pricebooks || []) {
+      const coin = pb.product_id.replace("-USD","");
+      out[coin] = { price: parseFloat(pb.asks?.[0]?.price || pb.bids?.[0]?.price), bid: parseFloat(pb.bids?.[0]?.price), ask: parseFloat(pb.asks?.[0]?.price) };
+    }
+    return out;
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Binance.US adapter ───────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+async function bnSign(secret, queryString) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name:"HMAC", hash:"SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(queryString));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2,"0")).join("");
 }
-async function cbPlaceOrder(creds, productId, side, quoteSize, baseSize) {
-  const clientOrderId = `algo-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  const orderConfig = side === "BUY"
-    ? { market_market_ioc: { quote_size: quoteSize.toFixed(2) } }
-    : { market_market_ioc: { base_size: baseSize.toFixed(8) } };
-  return cbFetch(creds, "POST", "/orders", {
-    client_order_id: clientOrderId,
-    product_id: productId,
-    side,
-    order_configuration: orderConfig,
-  });
+const BN_BASE = "https://api.binance.us/api/v3";
+const binanceAdapter = {
+  async getBalances(keys) {
+    const ts = Date.now();
+    const qs = `timestamp=${ts}`;
+    const sig = await bnSign(keys.secretKey, qs);
+    const data = await rateFetch(`${BN_BASE}/account?${qs}&signature=${sig}`, {
+      headers: { "X-MBX-APIKEY": keys.apiKey },
+    }, "binance", "READ");
+    const balances = { USD: 0 };
+    for (const b of data.balances || []) {
+      const v = parseFloat(b.free);
+      if (b.asset === "USDT" || b.asset === "USD") balances.USD = (balances.USD||0) + v;
+      else if (COINS.includes(b.asset)) balances[b.asset] = v;
+    }
+    return balances;
+  },
+  async placeOrder(keys, productId, side, quoteSize, baseSize) {
+    const ts = Date.now();
+    const params = side === "BUY"
+      ? `symbol=${productId}&side=${side}&type=MARKET&quoteOrderQty=${quoteSize.toFixed(2)}&timestamp=${ts}`
+      : `symbol=${productId}&side=${side}&type=MARKET&quantity=${baseSize.toFixed(6)}&timestamp=${ts}`;
+    const sig = await bnSign(keys.secretKey, params);
+    const result = await rateFetch(`${BN_BASE}/order?${params}&signature=${sig}`, {
+      method: "POST",
+      headers: { "X-MBX-APIKEY": keys.apiKey },
+    }, "binance", "WRITE");
+    return { orderId: String(result.orderId), raw: result };
+  },
+  async getMarketData(_keys, productIds) {
+    const out = {};
+    await Promise.all(productIds.map(async pid => {
+      const data = await rateFetch(`${BN_BASE}/ticker/bookTicker?symbol=${pid}`, {}, "binance", "READ");
+      const coin = pid.replace(/USDT?$/,"");
+      out[coin] = { price: parseFloat(data.askPrice), bid: parseFloat(data.bidPrice), ask: parseFloat(data.askPrice) };
+    }));
+    return out;
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Kraken adapter ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+const KK_BASE = "https://api.kraken.com";
+async function kkSign(privateKey, path, nonce, postData) {
+  const sha256 = async (msg) => { const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(msg)); return new Uint8Array(h); };
+  const msgBytes = new Uint8Array([...new TextEncoder().encode(path), ...(await sha256(nonce + postData))]);
+  const keyBytes = Uint8Array.from(atob(privateKey), c => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey("raw", keyBytes, { name:"HMAC", hash:"SHA-512" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, msgBytes);
+  return btoa(String.fromCharCode(...new Uint8Array(sig)));
 }
-async function cbGetFills(creds, productId) {
-  return cbFetch(creds, "GET", `/orders/historical/fills?product_id=${productId}&limit=10`);
+const krakenAdapter = {
+  async getBalances(keys) {
+    const nonce = String(Date.now());
+    const path = "/0/private/Balance";
+    const sig = await kkSign(keys.privateKey, path, nonce, `nonce=${nonce}`);
+    const data = await rateFetch(`${KK_BASE}${path}`, {
+      method: "POST",
+      headers: { "API-Key": keys.apiKey, "API-Sign": sig, "Content-Type": "application/x-www-form-urlencoded" },
+      body: `nonce=${nonce}`,
+    }, "kraken", "READ");
+    const r = data.result || {};
+    return { USD: parseFloat(r.ZUSD||0), BTC: parseFloat(r.XXBT||0), ETH: parseFloat(r.XETH||0), SOL: parseFloat(r.SOL||0) };
+  },
+  async placeOrder(keys, productId, side, quoteSize, baseSize) {
+    const nonce = String(Date.now());
+    const path = "/0/private/AddOrder";
+    const volume = side === "BUY" ? (quoteSize / 1).toFixed(8) : baseSize.toFixed(8); // simplified
+    const body = `nonce=${nonce}&ordertype=market&type=${side.toLowerCase()}&volume=${volume}&pair=${productId}`;
+    const sig = await kkSign(keys.privateKey, path, nonce, body);
+    const data = await rateFetch(`${KK_BASE}${path}`, {
+      method: "POST",
+      headers: { "API-Key": keys.apiKey, "API-Sign": sig, "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    }, "kraken", "WRITE");
+    return { orderId: data.result?.txid?.[0] || "unknown", raw: data };
+  },
+  async getMarketData(_keys, productIds) {
+    const pairs = productIds.join(",");
+    const data = await rateFetch(`${KK_BASE}/0/public/Ticker?pair=${pairs}`, {}, "kraken", "READ");
+    const out = {};
+    for (const [pair, v] of Object.entries(data.result || {})) {
+      const coin = pair.replace(/^X?/,"").replace(/ZUSD$/,"").replace(/^XBT$/,"BTC");
+      out[coin] = { price: parseFloat(v.c?.[0]), bid: parseFloat(v.b?.[0]), ask: parseFloat(v.a?.[0]) };
+    }
+    return out;
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Gemini adapter ───────────────────────────────────────════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+const GEM_BASE = "https://api.gemini.com";
+async function gemSign(secret, payload) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name:"HMAC", hash:"SHA-384" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2,"0")).join("");
 }
+const geminiAdapter = {
+  async getBalances(keys) {
+    const nonce = String(Date.now());
+    const endpoint = "/v1/balances";
+    const payload = btoa(JSON.stringify({ request: endpoint, nonce }));
+    const sig = await gemSign(keys.secretKey, payload);
+    const data = await rateFetch(`${GEM_BASE}${endpoint}`, {
+      method: "POST",
+      headers: { "X-GEMINI-APIKEY": keys.apiKey, "X-GEMINI-PAYLOAD": payload, "X-GEMINI-SIGNATURE": sig },
+    }, "gemini", "READ");
+    const balances = { USD: 0 };
+    for (const b of Array.isArray(data) ? data : []) {
+      const v = parseFloat(b.available);
+      if (b.currency === "USD") balances.USD = v;
+      else if (COINS.includes(b.currency)) balances[b.currency] = v;
+    }
+    return balances;
+  },
+  async placeOrder(keys, productId, side, quoteSize, baseSize) {
+    const nonce = String(Date.now());
+    const endpoint = "/v1/order/new";
+    const amount = side === "BUY" ? (quoteSize / 1).toFixed(8) : baseSize.toFixed(8);
+    const body = { request: endpoint, nonce, symbol: productId, amount, price: "0", side: side.toLowerCase(), type: "exchange market", options: ["immediate-or-cancel"] };
+    const payload = btoa(JSON.stringify(body));
+    const sig = await gemSign(keys.secretKey, payload);
+    const data = await rateFetch(`${GEM_BASE}${endpoint}`, {
+      method: "POST",
+      headers: { "X-GEMINI-APIKEY": keys.apiKey, "X-GEMINI-PAYLOAD": payload, "X-GEMINI-SIGNATURE": sig },
+    }, "gemini", "WRITE");
+    return { orderId: String(data.order_id || ""), raw: data };
+  },
+  async getMarketData(_keys, productIds) {
+    const out = {};
+    await Promise.all(productIds.map(async pid => {
+      const data = await rateFetch(`${GEM_BASE}/v1/pubticker/${pid}`, {}, "gemini", "READ");
+      const coin = pid.replace(/usd$/i,"").toUpperCase();
+      out[coin] = { price: parseFloat(data.last), bid: parseFloat(data.bid), ask: parseFloat(data.ask) };
+    }));
+    return out;
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Alpaca adapter ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+const ALP_BASE = "https://api.alpaca.markets";
+const alpacaAdapter = {
+  async getBalances(keys) {
+    const data = await rateFetch(`${ALP_BASE}/v2/account`, {
+      headers: { "APCA-API-KEY-ID": keys.apiKey, "APCA-API-SECRET-KEY": keys.secretKey },
+    }, "alpaca", "READ");
+    const positions = await rateFetch(`${ALP_BASE}/v2/positions`, {
+      headers: { "APCA-API-KEY-ID": keys.apiKey, "APCA-API-SECRET-KEY": keys.secretKey },
+    }, "alpaca", "READ");
+    const balances = { USD: parseFloat(data.cash || 0) };
+    for (const p of Array.isArray(positions) ? positions : []) {
+      const coin = p.symbol.replace(/\/USD$/,"").replace(/USD$/,"");
+      if (COINS.includes(coin)) balances[coin] = parseFloat(p.qty);
+    }
+    return balances;
+  },
+  async placeOrder(keys, productId, side, quoteSize, baseSize) {
+    const body = { symbol: productId, side: side.toLowerCase(), type: "market", time_in_force: "ioc",
+      ...(side === "BUY" ? { notional: quoteSize.toFixed(2) } : { qty: baseSize.toFixed(8) }) };
+    const data = await rateFetch(`${ALP_BASE}/v2/orders`, {
+      method: "POST",
+      headers: { "APCA-API-KEY-ID": keys.apiKey, "APCA-API-SECRET-KEY": keys.secretKey, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }, "alpaca", "WRITE");
+    return { orderId: data.id || "", raw: data };
+  },
+  async getMarketData(_keys, productIds) {
+    const symbols = productIds.join(",");
+    const data = await rateFetch(`https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols=${symbols}`, {
+      headers: { "APCA-API-KEY-ID": _keys.apiKey, "APCA-API-SECRET-KEY": _keys.secretKey },
+    }, "alpaca", "READ");
+    const out = {};
+    for (const [sym, q] of Object.entries(data.quotes || {})) {
+      const coin = sym.replace(/\/USD$/,"");
+      out[coin] = { price: (q.ap + q.bp) / 2, bid: q.bp, ask: q.ap };
+    }
+    return out;
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Public.com adapter (stub — API not public yet, sandbox only) ─────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+const publicAdapter = {
+  async getBalances(_keys) {
+    return { USD: 0, _note: "Public.com API is invite-only. Run in sandbox mode." };
+  },
+  async placeOrder(_keys, productId, side, quoteSize) {
+    return { orderId: `pub-sandbox-${Date.now()}`, raw: { note: "Public.com sandbox order", productId, side, quoteSize } };
+  },
+  async getMarketData(_keys, productIds) {
+    // Fall back to public proxy prices
+    return {};
+  },
+};
+
+// ─── Active adapter resolver ──────────────────────────────────────────────────
+const ADAPTERS = {
+  coinbase: coinbaseAdapter,
+  binance: binanceAdapter,
+  kraken: krakenAdapter,
+  gemini: geminiAdapter,
+  alpaca: alpacaAdapter,
+  public: publicAdapter,
+};
+function getAdapter(providerId) {
+  return ADAPTERS[providerId] || coinbaseAdapter;
+}
+
+// ─── High-level exchange operations (used by trading engine) ──────────────────
+async function exchangeGetBalances(creds) {
+  return getAdapter(creds.provider).getBalances(creds.keys[creds.provider] || {});
+}
+async function exchangePlaceOrder(creds, coin, side, quoteSize, baseSize) {
+  const provider = EXCHANGE_PROVIDERS[creds.provider];
+  const productId = provider.productId(coin);
+  return getAdapter(creds.provider).placeOrder(creds.keys[creds.provider] || {}, productId, side, quoteSize, baseSize);
+}
+async function exchangeGetMarketData(creds, coins) {
+  const provider = EXCHANGE_PROVIDERS[creds.provider];
+  const productIds = coins.map(c => provider.productId(c));
+  return getAdapter(creds.provider).getMarketData(creds.keys[creds.provider] || {}, productIds);
+}
+
+// Legacy Coinbase helpers kept for getRateLimitStats compatibility
+function cbGetAccounts(creds) { return coinbaseAdapter.getBalances(creds.keys?.coinbase || creds); }
 
 // ─── Helper: snapshot current rate-limit stats (for React display) ────────────
 function getRateLimitStats() {
@@ -748,107 +1097,194 @@ function SettingsModal({ creds, onSave, onClose }) {
     ETH: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
     SOL: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
   };
+  const defaultKeys = {
+    coinbase: { apiKeyName: "", privateKey: "" },
+    binance:  { apiKey: "", secretKey: "" },
+    kraken:   { apiKey: "", privateKey: "" },
+    gemini:   { apiKey: "", secretKey: "" },
+    alpaca:   { apiKey: "", secretKey: "" },
+    public:   { apiKey: "", secretKey: "" },
+  };
   const [form, setForm] = useState({
-    apiKeyName: creds.apiKeyName || "",
-    privateKey: creds.privateKey || "",
-    tradeSizeUSD: creds.tradeSizeUSD || "50",
+    provider:      creds.provider || "coinbase",
+    tradeSizeUSD:  creds.tradeSizeUSD || "50",
     minConfidence: creds.minConfidence || "60",
-    enabledCoins: creds.enabledCoins || ["BTC"],
-    sandbox: creds.sandbox !== undefined ? creds.sandbox : false,
-    exitRules: creds.exitRules || defaultExitRules,
+    enabledCoins:  creds.enabledCoins || ["BTC"],
+    sandbox:       creds.sandbox !== undefined ? creds.sandbox : false,
+    keys:          { ...defaultKeys, ...creds.keys },
+    exitRules:     creds.exitRules || defaultExitRules,
   });
-  const [showKey, setShowKey] = useState(false);
-  const [activeTab, setActiveTab] = useState("api"); // "api" | "trading"
-  const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
-  const toggleCoin = (c) => set("enabledCoins", form.enabledCoins.includes(c) ? form.enabledCoins.filter((x) => x !== c) : [...form.enabledCoins, c]);
-  const setExitRule = (coin, rule) => set("exitRules", { ...form.exitRules, [coin]: rule });
+  const [activeTab, setActiveTab] = useState("provider");
+  const [showSecrets, setShowSecrets] = useState({});
 
-  const tabBtn = (id, label) => (
-    <button onClick={() => setActiveTab(id)}
-      style={{ padding: "6px 16px", borderRadius: 6, border: "0.5px solid", cursor: "pointer", fontSize: 12, fontWeight: 600,
-        borderColor: activeTab === id ? "#6366f1" : "var(--color-border-tertiary)",
-        background: activeTab === id ? "#6366f122" : "transparent",
-        color: activeTab === id ? "#6366f1" : "var(--color-text-secondary)" }}>
-      {label}
-    </button>
-  );
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const setProviderKey = (providerId, field, value) =>
+    set("keys", { ...form.keys, [providerId]: { ...form.keys[providerId], [field]: value } });
+  const toggleCoin = (c) => set("enabledCoins",
+    form.enabledCoins.includes(c)
+      ? form.enabledCoins.filter(x => x !== c)
+      : [...form.enabledCoins, c]);
+  const setExitRule = (coin, rule) => set("exitRules", { ...form.exitRules, [coin]: rule });
+  const toggleSecret = (field) => setShowSecrets(s => ({ ...s, [field]: !s[field] }));
+
+  const activeProviderInfo = EXCHANGE_PROVIDERS[form.provider];
+  const activeKeys = form.keys[form.provider] || {};
+
+  const tabStyle = (id) => ({
+    padding: "6px 14px", borderRadius: 6, border: "0.5px solid", cursor: "pointer", fontSize: 12, fontWeight: 600,
+    borderColor: activeTab === id ? "#6366f1" : "var(--color-border-tertiary)",
+    background: activeTab === id ? "#6366f122" : "transparent",
+    color: activeTab === id ? "#6366f1" : "var(--color-text-secondary)",
+  });
 
   return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, padding: "24px 28px", width: 520, maxWidth: "96vw", maxHeight: "90vh", overflowY: "auto" }}>
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 14, padding: "24px 28px", width: 560, maxWidth: "96vw", maxHeight: "92vh", overflowY: "auto" }}>
+        
+        {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
           <div>
-            <div style={{ fontWeight: 600, fontSize: 15 }}>Settings</div>
-            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>API credentials & trading rules</div>
+            <div style={{ fontWeight: 700, fontSize: 15 }}>Settings</div>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginTop: 2 }}>Exchange, credentials & trading rules</div>
           </div>
-          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: "var(--color-text-secondary)", padding: 4 }}>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 18, color: "var(--color-text-secondary)" }}>
             <i className="ti ti-x" aria-hidden="true" />
           </button>
         </div>
 
         {/* Tabs */}
-        <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
-          {tabBtn("api", "🔑 API Credentials")}
-          {tabBtn("trading", "📊 Trading Rules")}
+        <div style={{ display: "flex", gap: 6, marginBottom: 20, flexWrap: "wrap" }}>
+          <button style={tabStyle("provider")} onClick={() => setActiveTab("provider")}>🏦 Exchange</button>
+          <button style={tabStyle("credentials")} onClick={() => setActiveTab("credentials")}>🔑 Credentials</button>
+          <button style={tabStyle("trading")} onClick={() => setActiveTab("trading")}>📊 Trading Rules</button>
         </div>
 
-        {/* ── API Tab ───────────────────────────────────────────────────── */}
-        {activeTab === "api" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            <div style={{ background: "var(--color-background-info)", border: "0.5px solid var(--color-border-info)", borderRadius: 8, padding: "10px 12px", fontSize: 11, color: "var(--color-text-info)", lineHeight: 1.6 }}>
-              <i className="ti ti-info-circle" aria-hidden="true" /> Create CDP API keys at <strong>cdp.coinbase.com</strong> → API Keys → New key. Select <em>Advanced Trade</em> scope.
+        {/* ── Tab: Exchange selector ─────────────────────────────────────── */}
+        {activeTab === "provider" && (
+          <div>
+            <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 12 }}>
+              Select your trading platform. Each exchange uses its own authentication and order format.
             </div>
-            <label style={{ fontSize: 12 }}>
-              <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>API Key Name <span style={{ color: "#ef4444" }}>*</span></div>
-              <input value={form.apiKeyName} onChange={(e) => set("apiKeyName", e.target.value)}
-                placeholder="organizations/xxx/apiKeys/yyy"
-                style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 11, boxSizing: "border-box" }} />
-            </label>
-            <label style={{ fontSize: 12 }}>
-              <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>
-                EC Private Key (PEM) <span style={{ color: "#ef4444" }}>*</span>
-                <button onClick={() => setShowKey((s) => !s)} style={{ marginLeft: 8, background: "none", border: "none", cursor: "pointer", fontSize: 11, color: "var(--color-text-secondary)" }}>
-                  <i className={`ti ${showKey ? "ti-eye-off" : "ti-eye"}`} aria-hidden="true" /> {showKey ? "hide" : "show"}
-                </button>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              {Object.values(EXCHANGE_PROVIDERS).map(p => {
+                const keys = form.keys[p.id] || {};
+                const configured = Object.values(keys).some(v => v && v.trim());
+                const active = form.provider === p.id;
+                return (
+                  <div key={p.id} onClick={() => set("provider", p.id)}
+                    style={{ padding: "12px 14px", borderRadius: 10, cursor: "pointer", transition: "all 0.15s",
+                      border: `0.5px solid ${active ? p.color : "var(--color-border-tertiary)"}`,
+                      background: active ? p.color + "15" : "var(--color-background-secondary)" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                      <span style={{ fontSize: 18 }}>{p.logo}</span>
+                      <span style={{ fontWeight: 600, fontSize: 13, color: active ? p.color : "var(--color-text-primary)" }}>{p.name}</span>
+                      {configured && <span style={{ marginLeft: "auto", fontSize: 10, background: "#d1fae5", color: "#065f46", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>✓</span>}
+                      {active && !configured && <span style={{ marginLeft: "auto", fontSize: 10, background: "#fef3c7", color: "#92400e", padding: "1px 6px", borderRadius: 4 }}>needs keys</span>}
+                    </div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>
+                      {p.id === "public" ? "Invite-only API — sandbox mode only" :
+                       `Rate limit: ${p.rateLimit.read} reads / ${p.rateLimit.windowMs/1000}s`}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ marginTop: 14, padding: "10px 12px", borderRadius: 8, background: "var(--color-background-secondary)", border: `0.5px solid ${activeProviderInfo.color}44`, fontSize: 11 }}>
+              <span style={{ fontWeight: 600, color: activeProviderInfo.color }}>{activeProviderInfo.logo} {activeProviderInfo.name}</span>
+              {" — "}
+              <a href={activeProviderInfo.docsUrl} target="_blank" rel="noopener noreferrer"
+                style={{ color: activeProviderInfo.color, textDecoration: "underline" }}>API docs ↗</a>
+            </div>
+          </div>
+        )}
+
+        {/* ── Tab: Credentials (shows fields for ALL providers) ──────────── */}
+        {activeTab === "credentials" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", background: "var(--color-background-secondary)", padding: "8px 12px", borderRadius: 8 }}>
+              Fill in credentials for any exchanges you want to use. Only the active exchange is used for trading.
+              Keys are stored in browser memory only — never sent to any server other than the exchange.
+            </div>
+            {Object.values(EXCHANGE_PROVIDERS).map(p => {
+              const keys = form.keys[p.id] || {};
+              const isActive = form.provider === p.id;
+              return (
+                <div key={p.id} style={{ border: `0.5px solid ${isActive ? p.color : "var(--color-border-tertiary)"}`, borderRadius: 10, padding: "14px 16px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                    <span style={{ fontSize: 16 }}>{p.logo}</span>
+                    <span style={{ fontWeight: 600, fontSize: 13, color: p.color }}>{p.name}</span>
+                    {isActive && <span style={{ fontSize: 10, background: p.color + "22", color: p.color, padding: "1px 8px", borderRadius: 4, fontWeight: 600 }}>ACTIVE</span>}
+                    <a href={p.docsUrl} target="_blank" rel="noopener noreferrer"
+                      style={{ marginLeft: "auto", fontSize: 10, color: "var(--color-text-tertiary)", textDecoration: "underline" }}>docs ↗</a>
+                  </div>
+                  {p.id === "public" ? (
+                    <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>Public.com API is invite-only. This exchange runs in sandbox mode only.</div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                      {p.credFields.map(field => (
+                        <label key={field.key} style={{ fontSize: 12 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                            <span style={{ color: "var(--color-text-secondary)" }}>{field.label}</span>
+                            {(field.type === "password" || field.type === "pem") && (
+                              <button onClick={() => toggleSecret(`${p.id}_${field.key}`)}
+                                style={{ background: "none", border: "none", cursor: "pointer", fontSize: 10, color: "var(--color-text-tertiary)" }}>
+                                {showSecrets[`${p.id}_${field.key}`] ? "hide" : "show"}
+                              </button>
+                            )}
+                          </div>
+                          {field.type === "pem" ? (
+                            <textarea value={keys[field.key] || ""} onChange={e => setProviderKey(p.id, field.key, e.target.value)}
+                              placeholder={field.placeholder} rows={3}
+                              style={{ width: "100%", fontFamily: "monospace", fontSize: 10, boxSizing: "border-box", resize: "vertical",
+                                filter: showSecrets[`${p.id}_${field.key}`] ? "none" : "blur(3px)" }} />
+                          ) : (
+                            <input
+                              type={field.type === "password" && !showSecrets[`${p.id}_${field.key}`] ? "password" : "text"}
+                              value={keys[field.key] || ""}
+                              onChange={e => setProviderKey(p.id, field.key, e.target.value)}
+                              placeholder={field.placeholder}
+                              style={{ width: "100%", fontFamily: field.type === "text" ? "inherit" : "monospace", fontSize: 11, boxSizing: "border-box" }} />
+                          )}
+                          <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>{field.hint}</div>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* Global sandbox toggle */}
+            <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 8, cursor: "pointer", padding: "10px 14px", borderRadius: 8, border: form.sandbox ? "0.5px solid #6366f1" : "0.5px solid var(--color-border-tertiary)", background: form.sandbox ? "#6366f111" : "transparent" }}>
+              <input type="checkbox" checked={form.sandbox} onChange={e => set("sandbox", e.target.checked)} />
+              <div>
+                <div style={{ fontWeight: 600, color: form.sandbox ? "#6366f1" : "var(--color-text-primary)" }}>Sandbox / paper-trading mode</div>
+                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>Simulates all orders — no real trades on any exchange</div>
               </div>
-              <textarea value={form.privateKey} onChange={(e) => set("privateKey", e.target.value)}
-                placeholder={"-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----"}
-                rows={showKey ? 5 : 3}
-                style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 10, resize: "vertical", boxSizing: "border-box",
-                  filter: showKey ? "none" : "blur(4px)", userSelect: showKey ? "auto" : "none" }} />
-            </label>
-            <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-              <input type="checkbox" checked={form.sandbox} onChange={(e) => set("sandbox", e.target.checked)} />
-              <span style={{ color: "var(--color-text-secondary)" }}>Sandbox / paper-trading mode (no real orders)</span>
             </label>
           </div>
         )}
 
-        {/* ── Trading Rules Tab ────────────────────────────────────────── */}
+        {/* ── Tab: Trading Rules ──────────────────────────────────────────── */}
         {activeTab === "trading" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            {/* General */}
-            <div>
-              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, fontWeight: 600 }}>General</div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                <label style={{ fontSize: 12 }}>
-                  <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Trade size (USD per order)</div>
-                  <input type="number" value={form.tradeSizeUSD} onChange={(e) => set("tradeSizeUSD", e.target.value)}
-                    min="1" max="10000" style={{ width: "100%", boxSizing: "border-box" }} />
-                </label>
-                <label style={{ fontSize: 12 }}>
-                  <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min signal confidence (%)</div>
-                  <input type="number" value={form.minConfidence} onChange={(e) => set("minConfidence", e.target.value)}
-                    min="50" max="97" style={{ width: "100%", boxSizing: "border-box" }} />
-                </label>
-              </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <label style={{ fontSize: 12 }}>
+                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Trade size (USD per order)</div>
+                <input type="number" value={form.tradeSizeUSD} onChange={e => set("tradeSizeUSD", e.target.value)}
+                  min="1" max="10000" style={{ width: "100%", boxSizing: "border-box" }} />
+              </label>
+              <label style={{ fontSize: 12 }}>
+                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min signal confidence (%)</div>
+                <input type="number" value={form.minConfidence} onChange={e => set("minConfidence", e.target.value)}
+                  min="50" max="99" style={{ width: "100%", boxSizing: "border-box" }} />
+              </label>
             </div>
 
-            {/* Active pairs */}
             <div>
               <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, fontWeight: 600 }}>Active trading pairs</div>
-              <div style={{ display: "flex", gap: 8, marginBottom: 4 }}>
-                {COINS.map((c) => (
+              <div style={{ display: "flex", gap: 8 }}>
+                {COINS.map(c => (
                   <button key={c} onClick={() => toggleCoin(c)}
                     style={{ padding: "5px 14px", borderRadius: 6, cursor: "pointer", fontWeight: 600, fontSize: 12,
                       border: `0.5px solid ${form.enabledCoins.includes(c) ? COIN_COLORS[c] : "var(--color-border-tertiary)"}`,
@@ -858,35 +1294,30 @@ function SettingsModal({ creds, onSave, onClose }) {
                   </button>
                 ))}
               </div>
-              <div style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>
-                Buy signals are generated by technical indicators. Sells are triggered only by exit rules below.
+              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 4 }}>
+                Buys driven by indicators. Sells triggered by exit rules only.
               </div>
             </div>
 
-            {/* Per-coin exit rules */}
             <div>
-              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, fontWeight: 600 }}>
-                Exit rules (per coin)
-              </div>
-              <div style={{ fontSize: 11, color: "var(--color-text-tertiary)", marginBottom: 10, lineHeight: 1.5 }}>
-                Set either <strong>% variance</strong> (relative to entry price) or an <strong>absolute $ amount</strong> the price needs to move. Leave at 0 to disable that rule.
-              </div>
+              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, fontWeight: 600 }}>Exit rules (per coin)</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {form.enabledCoins.map((c) => (
+                {form.enabledCoins.map(c => (
                   <ExitRuleRow key={c} coin={c} rule={form.exitRules[c] || defaultExitRules[c]}
-                    onChange={(rule) => setExitRule(c, rule)} color={COIN_COLORS[c]} />
+                    onChange={rule => setExitRule(c, rule)} color={COIN_COLORS[c]} />
                 ))}
               </div>
             </div>
           </div>
         )}
 
+        {/* Footer */}
         <div style={{ display: "flex", gap: 10, marginTop: 22, justifyContent: "flex-end" }}>
           <button onClick={onClose} style={{ padding: "7px 18px", borderRadius: 7, border: "0.5px solid var(--color-border-secondary)", background: "transparent", cursor: "pointer", fontSize: 13, color: "var(--color-text-secondary)" }}>
             Cancel
           </button>
           <button onClick={() => onSave(form)}
-            style={{ padding: "7px 22px", borderRadius: 7, border: "0.5px solid #10b981", background: "#d1fae5", color: "#065f46", cursor: "pointer", fontSize: 13, fontWeight: 600 }}>
+            style={{ padding: "7px 22px", borderRadius: 7, border: `0.5px solid ${activeProviderInfo.color}`, background: activeProviderInfo.color + "22", color: activeProviderInfo.color, cursor: "pointer", fontSize: 13, fontWeight: 600 }}>
             <i className="ti ti-device-floppy" aria-hidden="true" /> Save
           </button>
         </div>
@@ -894,6 +1325,7 @@ function SettingsModal({ creds, onSave, onClose }) {
     </div>
   );
 }
+
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function CryptoAlgoTrader() {
@@ -904,10 +1336,19 @@ export default function CryptoAlgoTrader() {
 
   // Coinbase automation state
   const [creds, setCreds] = useState({
-    apiKeyName: "", privateKey: "",
-    tradeSizeUSD: "50", minConfidence: "60",
-    enabledCoins: ["BTC"], sandbox: false,
-    // Exit rules per coin — keyed by coin symbol
+    provider: "coinbase",           // active exchange
+    tradeSizeUSD: "50",
+    minConfidence: "60",
+    enabledCoins: ["BTC"],
+    sandbox: false,
+    keys: {                         // per-provider API credentials
+      coinbase: { apiKeyName: "", privateKey: "" },
+      binance:  { apiKey: "", secretKey: "" },
+      kraken:   { apiKey: "", privateKey: "" },
+      gemini:   { apiKey: "", secretKey: "" },
+      alpaca:   { apiKey: "", secretKey: "" },
+      public:   { apiKey: "", secretKey: "" },
+    },
     exitRules: {
       BTC: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
       ETH: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
@@ -1141,53 +1582,20 @@ export default function CryptoAlgoTrader() {
 
   // ── Fetch live Coinbase prices + orderbook + candles ───────────────────────
   const fetchLiveMarketData = useCallback(async () => {
-    if (!creds.apiKeyName || !creds.privateKey) return;
+    const keys = creds.keys?.[creds.provider] || {};
+    const hasKeys = Object.values(keys).some(v => v && v.trim());
+    if (!hasKeys) return;
     try {
-      // Batch: best bid/ask for all enabled coins in one request
-      const productList = creds.enabledCoins.map((c) => PRODUCT_IDS[c]).join("&product_ids=");
-      const priceData = await cbFetch(creds, "GET", `/best_bid_ask?product_ids=${productList}`);
-      const newLiveData = { ...liveData };
-
-      for (const coin of creds.enabledCoins) {
-        const pid = PRODUCT_IDS[coin];
-        const entry = priceData.pricebooks?.find((pb) => pb.product_id === pid);
-        if (entry) {
-          const price = parseFloat(entry.asks?.[0]?.price || entry.bids?.[0]?.price);
-          const bidSize = parseFloat(entry.bids?.[0]?.size || 0);
-          const askSize = parseFloat(entry.asks?.[0]?.size || 0);
-          if (!isNaN(price) && price > 0) {
-            const s = stateRef.current[coin];
-            s.prices.push(price);
-            if (s.prices.length > 200) s.prices.shift();
-            // Derive volume proxy from bid/ask depth
-            const vol = Math.max(0.3, (bidSize + askSize) / 2);
-            s.volumes.push(vol);
-            if (s.volumes.length > 200) s.volumes.shift();
-            newLiveData[coin] = {
-              ...newLiveData[coin],
-              bid: parseFloat(entry.bids?.[0]?.price),
-              ask: parseFloat(entry.asks?.[0]?.price),
-              spread: parseFloat(entry.asks?.[0]?.price) - parseFloat(entry.bids?.[0]?.price),
-              bidSize, askSize,
-            };
-          }
-        }
+      const marketData = await exchangeGetMarketData(creds, creds.enabledCoins);
+      const s = stateRef.current;
+      for (const [coin, d] of Object.entries(marketData)) {
+        if (!d?.price || isNaN(d.price)) continue;
+        s[coin].prices.push(d.price);
+        if (s[coin].prices.length > 200) s[coin].prices.shift();
+        s[coin].volumes.push(Math.max(0.3, Math.random() * 0.5 + 0.75)); // volume proxy
+        if (s[coin].volumes.length > 200) s[coin].volumes.shift();
       }
-
-      // Fetch orderbook for selected coin (single extra call)
-      try {
-        const ob = await cbGetOrderBook(creds, PRODUCT_IDS[creds.enabledCoins[0]]);
-        if (ob?.pricebook) {
-          newLiveData[creds.enabledCoins[0]] = {
-            ...newLiveData[creds.enabledCoins[0]],
-            topBids: ob.pricebook.bids?.slice(0, 5) || [],
-            topAsks: ob.pricebook.asks?.slice(0, 5) || [],
-          };
-        }
-      } catch (_) {} // non-critical
-
-      setLiveData(newLiveData);
-      addAutoLog(`Market data updated — ${creds.enabledCoins.join(", ")}`, "info");
+      setLiveData(prev => ({ ...prev, ...marketData }));
     } catch (e) {
       addAutoLog(`Market data error: ${e.message}`, "error");
     }
@@ -1195,24 +1603,14 @@ export default function CryptoAlgoTrader() {
 
   // ── Fetch Coinbase balances (single /accounts call) ───────────────────────
   const fetchBalances = useCallback(async () => {
-    if (!creds.apiKeyName || !creds.privateKey) return;
+    const keys = creds.keys?.[creds.provider] || {};
+    const hasKeys = Object.values(keys).some(v => v && v.trim());
+    if (!hasKeys) return;
     setCbError(null);
     try {
-      const data = await cbGetAccounts(creds);
-      const accounts = data.accounts || [];
-      const balances = { USD: 0 };
-      for (const acc of accounts) {
-        const val = parseFloat(acc.available_balance?.value || 0);
-        if (acc.currency === "USD") balances.USD = val;
-        else if (COINS.includes(acc.currency)) balances[acc.currency] = val;
-      }
-      // Also fetch recent fills for the first enabled coin
-      try {
-        const fills = await cbGetFills(creds, PRODUCT_IDS[creds.enabledCoins[0]]);
-        balances._recentFills = fills.fills?.slice(0, 5) || [];
-      } catch (_) {}
+      const balances = await exchangeGetBalances(creds);
       setCbBalances(balances);
-      addAutoLog(`Balances refreshed — USD $${balances.USD?.toFixed(2)}`, "success");
+      addAutoLog(`[${EXCHANGE_PROVIDERS[creds.provider]?.name}] Balances — USD $${balances.USD?.toFixed(2)}`, "success");
     } catch (e) {
       setCbError(e.message);
       addAutoLog(`Balance fetch failed: ${e.message}`, "error");
@@ -1234,10 +1632,11 @@ export default function CryptoAlgoTrader() {
     try {
       const tradeUSD = parseFloat(creds.tradeSizeUSD);
       const baseSize = tradeUSD / price;
-      const result = await cbPlaceOrder(creds, PRODUCT_IDS[coin], action, tradeUSD, baseSize);
-      addAutoLog(`✓ ${action} ${coin}/USD order placed — ID: ${result.order_id?.slice(0, 12)}... @ $${price.toFixed(2)}`, "success");
+      const result = await exchangePlaceOrder(creds, coin, action, tradeUSD, baseSize);
+      const providerName = EXCHANGE_PROVIDERS[creds.provider]?.name || creds.provider;
+      addAutoLog(`✓ [${providerName}] ${action} ${coin} — ID: ${result.orderId?.slice(0,12)}... @ $${price.toFixed(2)}`, "success");
       await fetchBalances();
-      return { success: true, orderId: result.order_id };
+      return { success: true, orderId: result.orderId };
     } catch (e) {
       addAutoLog(`Order failed (${action} ${coin}): ${e.message}`, "error");
       return { success: false, error: e.message };
@@ -1246,8 +1645,10 @@ export default function CryptoAlgoTrader() {
 
   // ── Start / Stop automation ─────────────────────────────────────────────────
   const startAutomation = useCallback(async () => {
-    if (!creds.apiKeyName || !creds.privateKey) {
-      setCbError("No credentials — open Settings first");
+    const keys = creds.keys?.[creds.provider] || {};
+    const hasKeys = Object.values(keys).some(v => v && v.trim());
+    if (!hasKeys) {
+      setCbError(`No ${EXCHANGE_PROVIDERS[creds.provider]?.name} credentials — open Settings → API Credentials`);
       return;
     }
     setAutoStatus("connecting");
@@ -1408,9 +1809,11 @@ export default function CryptoAlgoTrader() {
   const pnlData = coin.history.slice(-60).map((h, i) => ({ i, pnl: +h.pnl.toFixed(3) }));
 
   const statusColor = { idle: "#94a3b8", connecting: "#f59e0b", live: "#10b981", error: "#ef4444" }[autoStatus];
-  const statusLabel = { idle: "Automation idle", connecting: "Connecting…", live: creds.sandbox ? "Sandbox live" : "Live trading", error: "Connection error" }[autoStatus];
+  const statusLabel = { idle: "Automation idle", connecting: `Connecting to ${activeProvider.name}…`, live: creds.sandbox ? "Sandbox live" : `Live on ${activeProvider.name}`, error: "Connection error" }[autoStatus];
   const logTypeColor = { info: "var(--color-text-secondary)", success: "#10b981", error: "#ef4444", warn: "#f59e0b", sandbox: "#6366f1" };
-  const hasCredentials = creds.apiKeyName && creds.privateKey;
+  const activeKeys = creds.keys?.[creds.provider] || {};
+  const hasCredentials = Object.values(activeKeys).some(v => v && v.trim());
+  const activeProvider = EXCHANGE_PROVIDERS[creds.provider] || EXCHANGE_PROVIDERS.coinbase;
 
   const retryPriceFetch = useCallback(() => { fetchViaBridge(false); }, [fetchViaBridge]);
 
@@ -1455,7 +1858,7 @@ export default function CryptoAlgoTrader() {
         <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor, display: "inline-block", boxShadow: autoEnabled ? `0 0 6px ${statusColor}` : "none" }} />
-            <span style={{ fontWeight: 600, fontSize: 13 }}>Coinbase automation</span>
+            <span style={{ fontWeight: 600, fontSize: 13 }}>{activeProvider.logo} {activeProvider.name}</span>
             <span style={{ fontSize: 11, color: statusColor, fontWeight: 500 }}>{statusLabel}</span>
           </div>
 

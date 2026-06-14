@@ -1357,6 +1357,7 @@ function CryptoAlgoTrader() {
     },
   });
   const [autoEnabled, setAutoEnabled] = useState(false);
+  const [warmingUp, setWarmingUp]         = useState(false); // 5-min warmup after going live
   const [manualBuying, setManualBuying]   = useState(false); // per-coin buy in progress
   const [manualSelling, setManualSelling] = useState(false); // per-coin sell in progress
   const [manualConfirm, setManualConfirm] = useState(null);  // { action, coin, price } pending confirm
@@ -1375,8 +1376,12 @@ function CryptoAlgoTrader() {
     ETH: { prices: [COIN_BASE.ETH], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
     SOL: { prices: [COIN_BASE.SOL], volumes: [1], history: [], pnl: 0, position: null, trades: 0 },
   });
-  // Latest live prices from 2s poller — read by runTick, written by fetchLiveMarketData
+  // Latest live prices from 5s poller — read by runTick, written by applyPrices
   const livePriceRef = useRef({});
+  // Warmup: track when live automation started — no orders in first 5 min
+  const liveStartRef = useRef(null);
+  // Active orders: orderId → { coin, action, placedAt, timeout }
+  const activeOrdersRef = useRef({});
   const [snapshot, setSnapshot] = useState(() => JSON.parse(JSON.stringify(stateRef.current)));
   const [news, setNews] = useState([]);
   const [activeSentiment, setActiveSentiment] = useState(0);
@@ -1619,7 +1624,7 @@ function CryptoAlgoTrader() {
   // Both modes use fetchViaBridge which handles iframe/top-level detection.
   useEffect(() => {
     if (autoEnabled) {
-      const id = setInterval(() => fetchViaBridge(true, creds.provider), 5_000);
+      const id = setInterval(() => fetchViaBridge(true, creds.provider), 2_000);
       return () => clearInterval(id);
     }
     if (running) {
@@ -1694,33 +1699,61 @@ function CryptoAlgoTrader() {
       const orderId = data.orderId;
       addAutoLog(`⏳ [${providerName}] ${action} ${coin} order placed — ID: ${orderId?.slice(0,12)}... @ $${price.toFixed(2)}`, "info");
 
-      // Poll for fill status (up to 10s, every 1s)
+      // Track active order
+      activeOrdersRef.current[orderId] = { coin, action, price, placedAt: Date.now() };
+
+      // Poll for fill — every 5s for up to 2 minutes, then cancel if BUY
+      const POLL_INTERVAL  = 5_000;
+      const CANCEL_TIMEOUT = 2 * 60 * 1000; // 2 minutes
+      const provider = EXCHANGE_PROVIDERS[creds.provider];
+      const keys2    = creds.keys?.[creds.provider] || {};
+      const productId = provider?.productId(coin) || coin;
       let filled = false;
-      for (let i = 0; i < 10; i++) {
-        await new Promise(r => setTimeout(r, 1000));
+      let cancelled = false;
+      const deadline = Date.now() + CANCEL_TIMEOUT;
+
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL));
         try {
-          const provider = EXCHANGE_PROVIDERS[creds.provider];
-          const keys = creds.keys?.[creds.provider] || {};
-          const productId = provider.productId(coin);
-          const qs = new URLSearchParams({
-            exchange: creds.provider, orderId, productId, ...keys
-          }).toString();
-          const sRes = await fetch(`${PROXY_BASE}/orderstatus?${qs}`);
+          const qs = new URLSearchParams({ exchange: creds.provider, orderId, productId, ...keys2 }).toString();
+          const sRes  = await fetch(`${PROXY_BASE}/orderstatus?${qs}`);
           const sData = await sRes.json();
           if (sData.done) {
-            const fillPrice = sData.price || price;
-            addAutoLog(`✓ [${providerName}] ${action} ${coin} FILLED @ $${fillPrice.toFixed(2)} — qty: ${sData.filled?.toFixed(6)}`, "success");
+            const fillPrice = parseFloat(sData.price) || price;
+            addAutoLog(`✓ [${providerName}] ${action} ${coin} FILLED @ $${fillPrice.toFixed(2)} qty: ${sData.filled?.toFixed(6) ?? "?"}`, "success");
             filled = true;
             break;
-          } else {
-            addAutoLog(`⏳ [${providerName}] ${action} ${coin} status: ${sData.status} (${sData.filled?.toFixed(6)}/${sData.total?.toFixed(6)})`, "info");
           }
-        } catch (_) { break; } // status check failed, proceed anyway
+          const elapsed = Math.round((Date.now() - activeOrdersRef.current[orderId].placedAt) / 1000);
+          addAutoLog(`⏳ [${providerName}] ${action} ${coin} ${sData.status || "pending"} (${elapsed}s elapsed)`, "info");
+        } catch (_) {
+          // Status check failed — keep trying until timeout
+        }
       }
-      if (!filled) addAutoLog(`⚠ [${providerName}] ${action} ${coin} — could not confirm fill status`, "warn");
 
+      // BUY not filled within 2 min → cancel and reset
+      if (!filled && action === "BUY") {
+        addAutoLog(`⚠ [${providerName}] BUY ${coin} not filled in 2 min — cancelling order`, "warn");
+        try {
+          const cancelRes = await fetch(`${PROXY_BASE}/cancelorder`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ exchange: creds.provider, orderId, productId, ...keys2 }),
+          });
+          const cancelData = await cancelRes.json();
+          addAutoLog(`🚫 [${providerName}] BUY ${coin} order cancelled — ${cancelData.status || "done"}`, "warn");
+          cancelled = true;
+        } catch (e) {
+          addAutoLog(`⚠ [${providerName}] Cancel failed: ${e.message}`, "error");
+        }
+        delete activeOrdersRef.current[orderId];
+        return { success: false, reason: "timeout_cancelled", orderId };
+      }
+
+      if (!filled) addAutoLog(`⚠ [${providerName}] ${action} ${coin} — fill unconfirmed after 2 min`, "warn");
+      delete activeOrdersRef.current[orderId];
       await fetchBalances();
-      return { success: true, orderId };
+      return { success: true, orderId, filled };
     } catch (e) {
       addAutoLog(`Order failed (${action} ${coin}): ${e.message}`, "error");
       return { success: false, error: e.message };
@@ -1739,29 +1772,43 @@ function CryptoAlgoTrader() {
     addAutoLog(`Connecting to ${EXCHANGE_PROVIDERS[creds.provider]?.name || creds.provider} API...`, "info");
     try {
       await fetchBalances();
-      await fetchLiveMarketData();
-      // Reset simulation state so sim positions don't bleed into live trading
+
+      // Reset all state — sim positions must not bleed into live
       const s = stateRef.current;
       COINS.forEach(coin => {
-        s[coin].position = null;  // clear any sim position
+        s[coin].position = null;
         s[coin].pnl      = 0;
         s[coin].trades   = 0;
         s[coin].history  = [];
       });
-      livePriceRef.current = {};
-      tickRef.current = 0;
+      livePriceRef.current  = {};
+      activeOrdersRef.current = {};
+      tickRef.current       = 0;
+      liveStartRef.current  = Date.now();
       setSnapshot(JSON.parse(JSON.stringify(s)));
+      setWarmingUp(true);
 
       setAutoStatus("live");
       setAutoEnabled(true);
       setRunning(true);
       addAutoLog(`Live trading started — pairs: ${creds.enabledCoins.join(", ")} | size: $${creds.tradeSizeUSD} | min conf: ${creds.minConfidence}%${creds.sandbox ? " | SANDBOX" : ""}`, "success");
+      addAutoLog("⏳ 5-minute warmup — collecting price data before executing orders", "warn");
+
+      // Kick off first price fetch via bridge (handles CORS)
+      fetchViaBridge(false, creds.provider);
+
+      // After 5 minutes lift the warmup flag
+      setTimeout(() => {
+        setWarmingUp(false);
+        addAutoLog("✓ Warmup complete — algo is now active and will execute orders", "success");
+      }, 5 * 60 * 1000);
+
     } catch (e) {
       setAutoStatus("error");
       setCbError(e.message);
       addAutoLog(`Connection failed: ${e.message}`, "error");
     }
-  }, [creds, fetchBalances, fetchLiveMarketData, addAutoLog]);
+  }, [creds, fetchBalances, fetchViaBridge, addAutoLog]);
 
   // ── Manual trade execution ────────────────────────────────────────────────
   const executeManualTrade = useCallback(async (coin, action) => {
@@ -1897,7 +1944,10 @@ function CryptoAlgoTrader() {
     setAutoEnabled(false);
     setAutoStatus("idle");
     setRunning(false);
-    addAutoLog("Automation stopped by user", "warn");
+    setWarmingUp(false);
+    liveStartRef.current  = null;
+    activeOrdersRef.current = {};
+    addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
   // ── Main simulation tick ────────────────────────────────────────────────────
@@ -1978,10 +2028,12 @@ function CryptoAlgoTrader() {
       const shouldSell    = cs.position && (hitTakeProfit || hitStopLoss);
       const sellReason    = hitTakeProfit ? "TAKE_PROFIT" : hitStopLoss ? "STOP_LOSS" : null;
 
-      // ── BUY: signal-driven, gated by confidence threshold ───────────────────
+      // ── BUY: signal-driven, gated by confidence threshold + warmup ────────────
       const minConf = parseFloat(creds.minConfidence) || 60;
       const confPassed = parseFloat(signal.confidence) >= minConf;
-      if (signal.action === "BUY" && !cs.position && confPassed) {
+      const warmupDone = !autoEnabled || !liveStartRef.current ||
+        (Date.now() - liveStartRef.current) >= 5 * 60 * 1000;
+      if (signal.action === "BUY" && !cs.position && confPassed && warmupDone) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
           // LIVE: place order first, only set position after confirmation
           executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence))
@@ -2153,6 +2205,12 @@ function CryptoAlgoTrader() {
           </div>
 
           {cbError && <span style={{ fontSize: 11, color: "#ef4444", flex: 1 }}><i className="ti ti-alert-circle" aria-hidden="true" /> {cbError}</span>}
+        {warmingUp && autoEnabled && (
+          <span style={{ fontSize: 11, color: "#f59e0b", display: "flex", alignItems: "center", gap: 5 }}>
+            <i className="ti ti-clock" aria-hidden="true" />
+            Warmup — collecting data, orders paused for 5 min
+          </span>
+        )}
 
           <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
             {cbBalances && (

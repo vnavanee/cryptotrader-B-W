@@ -1378,7 +1378,7 @@ function CryptoAlgoTrader() {
   });
   // Latest live prices from 5s poller — read by runTick, written by applyPrices
   const livePriceRef = useRef({});
-  // Warmup: track when live automation started — no orders in first 5 min
+  // Warmup: track when live automation started — no orders in first 2 min
   const liveStartRef = useRef(null);
   // Active orders: orderId → { coin, action, placedAt, timeout }
   const activeOrdersRef = useRef({});
@@ -1476,7 +1476,7 @@ function CryptoAlgoTrader() {
     }
   }, []);
 
-  // Fetch news on mount and every 5 minutes (NewsData free tier: ~200 req/day)
+  // Fetch news on mount and every 2 minutes (NewsData free tier: ~200 req/day)
   useEffect(() => {
     fetchRealNews();
     const id = setInterval(fetchRealNews, 5 * 60 * 1000);
@@ -1796,16 +1796,16 @@ function CryptoAlgoTrader() {
       setAutoEnabled(true);
       setRunning(true);
       addAutoLog(`Live trading started — pairs: ${creds.enabledCoins.join(", ")} | size: $${creds.tradeSizeUSD} | min conf: ${creds.minConfidence}%${creds.sandbox ? " | SANDBOX" : ""}`, "success");
-      addAutoLog("⏳ 5-minute warmup — collecting price data before executing orders", "warn");
+      addAutoLog("⏳ 2-minute warmup — collecting price data. Buy signals will fire after warmup completes.", "warn");
 
       // Kick off first price fetch via bridge (handles CORS)
       fetchViaBridge(false, creds.provider);
 
-      // After 5 minutes lift the warmup flag
+      // After 2 minutes lift the warmup flag
       setTimeout(() => {
         setWarmingUp(false);
-        addAutoLog("✓ Warmup complete — algo is now active and will execute orders", "success");
-      }, 5 * 60 * 1000);
+        addAutoLog("✓ Warmup complete — BUY signals are now active. Monitoring for entry signals...", "success");
+      }, 2 * 60 * 1000);
 
     } catch (e) {
       setAutoStatus("error");
@@ -1902,7 +1902,7 @@ function CryptoAlgoTrader() {
       // Reconcile local position state with exchange reality
       // Skip adoption during warmup — pre-existing exchange balances are not algo positions
       const inWarmupSync = liveStartRef.current !== null &&
-        (Date.now() - liveStartRef.current) < 5 * 60 * 1000;
+        (Date.now() - liveStartRef.current) < 2 * 60 * 1000;
 
       const s = stateRef.current;
       let reconciled = false;
@@ -1910,29 +1910,21 @@ function CryptoAlgoTrader() {
         const exPos   = data.positions?.[coin];
         const localPos = s[coin].position;
 
-        if (exPos && exPos.qty > 0 && !localPos && !inWarmupSync) {
-          // Exchange has a position the algo doesn't know about — adopt it
-          // (only after warmup so pre-existing balances aren't confused with algo positions)
-          s[coin].position = {
-            price:        exPos.entryPrice || s[coin].prices.at(-1),
-            size:         exPos.qty,
-            entryTick:    tickRef.current,
-            fromExchange: true,
-            algoOwned:    false,  // exchange-synced — algo must not auto-sell
-          };
-          addAutoLog(`[SYNC] Adopted ${coin} position from exchange — qty: ${exPos.qty.toFixed(6)}`, "info");
-          reconciled = true;
-        } else if (exPos && exPos.qty > 0 && !localPos && inWarmupSync) {
-          // During warmup — log that we see a balance but don't adopt it as a position
-          addAutoLog(`[SYNC] ${coin} balance on exchange (${exPos.qty.toFixed(6)}) — not adopted during warmup`, "info");
-        } else if (!exPos?.qty && localPos?.fromExchange) {
-          // Exchange closed a position we thought was open
+        // Report exchange balance for info only — never adopt as algo position
+        // Algo only sells what it explicitly bought (algoOwned: true)
+        if (exPos && exPos.qty > 0) {
+          const label = inWarmupSync ? "warmup" : "live";
+          addAutoLog(`[SYNC] ${coin} exchange balance: ${exPos.qty.toFixed(6)} [${label}] — display only`, "info");
+        }
+        // If algo thinks it has a position but exchange shows zero qty,
+        // and the position was algo-owned, mark it as externally closed
+        if (!exPos?.qty && localPos?.algoOwned) {
           const price  = s[coin].prices.at(-1);
           const profit = localPos.price ? (price - localPos.price) / localPos.price * 100 : 0;
           s[coin].pnl += profit;
           s[coin].position = null;
           s[coin].trades++;
-          addAutoLog(`[SYNC] ${coin} position closed on exchange — P&L: ${profit >= 0 ? "+" : ""}${profit.toFixed(2)}%`, profit >= 0 ? "success" : "warn");
+          addAutoLog(`[SYNC] ${coin} algo position closed externally — P&L: ${profit >= 0 ? "+" : ""}${profit.toFixed(2)}%`, profit >= 0 ? "success" : "warn");
           reconciled = true;
         }
       }
@@ -2044,7 +2036,7 @@ function CryptoAlgoTrader() {
 
       // ── Warmup check (ref-based — never stale) ───────────────────────────────
       const inWarmup = liveStartRef.current !== null &&
-        (Date.now() - liveStartRef.current) < 5 * 60 * 1000;
+        (Date.now() - liveStartRef.current) < 2 * 60 * 1000;
 
       // ── BUY: signal-driven ────────────────────────────────────────────────────
       const minConf    = parseFloat(creds.minConfidence) || 60;
@@ -2053,7 +2045,8 @@ function CryptoAlgoTrader() {
       // Only buy if: BUY signal, no position, confidence ok, warmup done, no pending order
       if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
-          // LIVE — mark pending immediately to block duplicate orders
+          // LIVE — log the signal and mark pending immediately
+          addAutoLog(`🔔 BUY signal ${coin} @ $${newPrice.toFixed(2)} — conf ${signal.confidence}% score ${signal.score} — submitting order`, "info");
           pendingRef.current[coin] = "BUY";
           executeRealTrade(coin, "BUY", newPrice, parseFloat(signal.confidence))
             .then(result => {
@@ -2093,7 +2086,8 @@ function CryptoAlgoTrader() {
 
       if (canSell) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
-          // LIVE — mark pending and clear position optimistically to block duplicate sells
+          // LIVE — log sell trigger and mark pending
+          addAutoLog(`🔔 ${sellReason} ${coin} @ $${newPrice.toFixed(2)} — submitting SELL order`, "info");
           pendingRef.current[coin] = "SELL";
           const posAtSell = { ...cs.position };
           // Clear position immediately in ref to prevent re-trigger on next tick
@@ -2125,7 +2119,7 @@ function CryptoAlgoTrader() {
       }
 
       // Store sell reason in the history entry below
-      const exitTrigger = shouldSell ? sellReason : null;
+      const exitTrigger = canSell ? sellReason : null;
 
       const unrealized = cs.position ? (newPrice - cs.position.price) / cs.position.price * 100 : 0;
       cs.history.push({
@@ -2257,7 +2251,7 @@ function CryptoAlgoTrader() {
         {warmingUp && autoEnabled && (
           <span style={{ fontSize: 11, color: "#f59e0b", display: "flex", alignItems: "center", gap: 5 }}>
             <i className="ti ti-clock" aria-hidden="true" />
-            Warmup — collecting data, orders paused for 5 min
+            Warmup — collecting data, orders paused for 2 min
           </span>
         )}
 

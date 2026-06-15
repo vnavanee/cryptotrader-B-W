@@ -1884,11 +1884,12 @@ function CryptoAlgoTrader() {
       s.trades++;
       addAutoLog(`[MANUAL] BUY ${coin} @ $${price.toFixed(2)}`, "info");
     } else if (action === "SELL" && s.position) {
-      const profit = (price - s.position.price) / s.position.price * 100;
+      const profit = (price - s.position.price) * s.position.size;
+      const profitPct = s.position.price ? (price - s.position.price) / s.position.price * 100 : 0;
       s.pnl += profit;
       s.position = null;
       s.trades++;
-      addAutoLog(`[MANUAL] SELL ${coin} @ $${price.toFixed(2)} → ${profit >= 0 ? "+" : ""}${profit.toFixed(2)}%`, profit >= 0 ? "success" : "warn");
+      addAutoLog(`[MANUAL] SELL ${coin} @ $${price.toFixed(2)} → ${profit >= 0 ? "+" : ""}$${Math.abs(profit).toFixed(2)} (${profitPct >= 0 ? "+" : ""}${profitPct.toFixed(2)}%)`, profit >= 0 ? "success" : "warn");
     } else if (action === "SELL" && !s.position) {
       addAutoLog(`[MANUAL] SELL ignored — no open position for ${coin}`, "warn");
       setManualSelling(false);
@@ -1973,11 +1974,12 @@ function CryptoAlgoTrader() {
         // and the position was algo-owned, mark it as externally closed
         if (!exPos?.qty && localPos?.algoOwned) {
           const price  = s[coin].prices.at(-1);
-          const profit = localPos.price ? (price - localPos.price) / localPos.price * 100 : 0;
+          const profit = localPos.price ? (price - localPos.price) * (localPos.size || 0) : 0;
+          const profitPct = localPos.price ? (price - localPos.price) / localPos.price * 100 : 0;
           s[coin].pnl += profit;
           s[coin].position = null;
           s[coin].trades++;
-          addAutoLog(`[SYNC] ${coin} algo position closed externally — P&L: ${profit >= 0 ? "+" : ""}${profit.toFixed(2)}%`, profit >= 0 ? "success" : "warn");
+          addAutoLog(`[SYNC] ${coin} closed externally — P&L: ${profit >= 0 ? "+" : ""}$${Math.abs(profit).toFixed(2)} (${profitPct.toFixed(2)}%)`, profit >= 0 ? "success" : "warn");
           reconciled = true;
         }
       }
@@ -2157,7 +2159,8 @@ function CryptoAlgoTrader() {
           executeRealTrade(coin, "SELL", newPrice, 100, sellQty)
             .then(result => {
               if (result?.success) {
-                const profit = (newPrice - posAtSell.price) / posAtSell.price * 100;
+                // Dollar P&L: size * (sellPrice - buyPrice)
+                const profit = (result.fillPrice || newPrice - posAtSell.price) * posAtSell.size;
                 stateRef.current[coin].pnl    += profit;
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
@@ -2175,8 +2178,8 @@ function CryptoAlgoTrader() {
               pendingRef.current[coin] = null;
             });
         } else {
-          // SIMULATION
-          const profit = (newPrice - cs.position.price) / cs.position.price * 100;
+          // SIMULATION — dollar P&L
+          const profit = (newPrice - cs.position.price) * cs.position.size;
           cs.pnl += profit;
           cs.position = null;
           cs.trades++;
@@ -2199,7 +2202,8 @@ function CryptoAlgoTrader() {
         agreeingCount: signal.agreeingCount,
         totalIndicators: signal.totalIndicators,
         volumeRatio, reasons: signal.reasons,
-        pnl: cs.pnl + unrealized,
+        // pnl stored in dollars for chart
+        pnl: cs.pnl + (cs.position ? (newPrice - cs.position.price) * (cs.position.size || 0) : 0),
         exitTrigger,
         takeProfitPrice: cs.position ? takeProfitPrice : null,
         stopLossPrice: cs.position ? stopLossPrice : null,
@@ -2221,7 +2225,14 @@ function CryptoAlgoTrader() {
   const lastH = coin.history[coin.history.length - 1];
   const currentPrice = coin.prices[coin.prices.length - 1];
   const priceChange = coin.prices.length > 1 ? ((currentPrice - coin.prices[coin.prices.length - 2]) / coin.prices[coin.prices.length - 2]) * 100 : 0;
-  const unrealized = coin.position ? ((currentPrice - coin.position.price) / coin.position.price) * 100 : 0;
+  // Dollar P&L: size * (currentPrice - entryPrice)
+  const unrealizedDollar = coin.position
+    ? (currentPrice - coin.position.price) * (coin.position.size || 0)
+    : 0;
+  // Percentage P&L for display
+  const unrealized = coin.position && coin.position.price
+    ? ((currentPrice - coin.position.price) / coin.position.price) * 100
+    : 0;
 
   const chartData = coin.history.slice(-60).map((h, i) => ({
     i, price: +h.price.toFixed(2),
@@ -2519,14 +2530,14 @@ function CryptoAlgoTrader() {
           <ResponsiveContainer width="100%" height={80}>
             <LineChart data={pnlData} margin={{ top: 2, right: 4, left: 0, bottom: 0 }}>
               <XAxis dataKey="i" hide />
-              <YAxis width={36} tick={{ fontSize: 9 }} tickFormatter={(v) => v.toFixed(1) + "%"} />
+              <YAxis width={42} tick={{ fontSize: 9 }} tickFormatter={(v) => "$" + v.toFixed(2)} />
               <ReferenceLine y={0} stroke="var(--color-border-secondary)" strokeWidth={0.8} />
               <Tooltip formatter={(v) => [v?.toFixed(3) + "%", "P&L"]} labelFormatter={() => ""} contentStyle={{ fontSize: 10 }} />
               <Line type="monotone" dataKey="pnl" stroke={coin.pnl >= 0 ? "#10b981" : "#ef4444"} strokeWidth={1.5} dot={false} />
             </LineChart>
           </ResponsiveContainer>
           <div style={{ fontSize: 11, marginTop: 4, color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-            Total: {fmtPct(coin.pnl + unrealized)}{" - "}{coin.trades}{" trades"}
+            {"$"}{(coin.pnl + unrealizedDollar).toFixed(2)}{" ("}{fmtPct((coin.pnl + unrealizedDollar) / parseFloat(creds.tradeSizeUSD || 50) * 100)}{")"}{" - "}{coin.trades}{" trades"}
           </div>
         </div>
       </div>
@@ -2624,7 +2635,7 @@ function CryptoAlgoTrader() {
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Qty: <strong>{(coin.position.size || 0).toFixed(8)} {selectedCoin}</strong></div>
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Now: <strong>${fmt(currentPrice, 2)}</strong></div>
                 <div style={{ fontSize: 13, fontWeight: 700, color: unrealized >= 0 ? "#10b981" : "#ef4444", marginBottom: 6 }}>
-                  {fmtPct(unrealized)}
+                  {fmtPct(unrealized)}{" ($"}{Math.abs(unrealizedDollar).toFixed(2)}{")"}
                 </div>
                 {tp && <div style={{ fontSize: 10, color: "#10b981", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                   <span>↑ TP</span><strong>${fmt(tp, 2)}</strong>
@@ -2818,7 +2829,7 @@ function CryptoAlgoTrader() {
         )}
         {creds.sandbox && autoEnabled && <span style={{ color: "#6366f1", fontWeight: 600 }}>{"SANDBOX MODE - no real orders"}</span>}
         <span style={{ marginLeft: "auto", color: (coin.pnl + unrealized) >= 0 ? "#10b981" : "#ef4444" }}>
-          {"P&L: "}{fmtPct(coin.pnl + unrealized)}{" ("}{coin.trades}{" trades)"}
+          {"P&L: $"}{(coin.pnl + unrealizedDollar).toFixed(2)}{" ("}{fmtPct(unrealized)}{")"}{" "}{coin.trades}{" trades"}
         </span>
       </div>
     </div>

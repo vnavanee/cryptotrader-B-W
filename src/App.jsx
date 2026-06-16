@@ -212,6 +212,16 @@ function calcMACD(prices) {
 //   3. Confidence >= the user-set threshold (checked in runTick)
 const MIN_AGREEING_INDICATORS = 3; // at least 3 of 5 must agree
 
+// ─── ATR (Average True Range) ────────────────────────────────────────────────
+function calcATR(prices, period = 14) {
+  if (prices.length < period + 1) return null;
+  const trueRanges = prices.slice(-period - 1).map((p, i, arr) => {
+    if (i === 0) return 0;
+    return Math.abs(arr[i] - arr[i - 1]); // simplified TR (no high/low data)
+  }).slice(1);
+  return trueRanges.reduce((a, b) => a + b, 0) / period;
+}
+
 function generateSignal(indicators, newsSentiment, volumeRatio) {
   // Each entry: { weight, vote: +1 bull | -1 bear | 0 neutral, reason, active }
   const signals = [];
@@ -831,6 +841,18 @@ function getRateLimitStats() {
 }
 
 // ─── Utility formatters ────────────────────────────────────────────────────────
+// ─── Fee-adjusted profit calculation ─────────────────────────────────────────
+// Fee is charged on both sides (BUY and SELL), each as a % of the notional value.
+// BUY cost:  qty * buyPrice * (1 + fee%)
+// SELL recv: qty * sellPrice * (1 - fee%)
+// Net profit = SELL recv - BUY cost = qty * (sellPrice*(1-f) - buyPrice*(1+f))
+function calcProfit(buyPrice, sellPrice, qty, feePercent) {
+  const f = (parseFloat(feePercent) || 0) / 100;
+  const buyCost   = qty * buyPrice  * (1 + f);
+  const sellRecv  = qty * sellPrice * (1 - f);
+  return sellRecv - buyCost;
+}
+
 // Binance LOT_SIZE step sizes (minimum quantity increments per coin)
 // https://api.binance.us/api/v3/exchangeInfo for exact values
 const LOT_STEPS = { BTC: 0.00001, ETH: 0.0001, SOL: 0.01 };
@@ -1118,12 +1140,20 @@ function SettingsModal({ creds, onSave, onClose }) {
   };
   const [form, setForm] = useState({
     provider:      creds.provider || "coinbase",
-    tradeSizeUSD:  creds.tradeSizeUSD || "50",
+    tradeSizeUSD:  creds.tradeSizeUSD  || "50",
     minConfidence: creds.minConfidence || "60",
+    feePercent:    creds.feePercent    || "0.1",
     enabledCoins:  creds.enabledCoins || ["BTC"],
     sandbox:       creds.sandbox !== undefined ? creds.sandbox : false,
     keys:          { ...defaultKeys, ...creds.keys },
     exitRules:     creds.exitRules || defaultExitRules,
+    exitStrategies: creds.exitStrategies || {
+      timeExit:       { enabled: true,  maxHoldMinutes: "30"  },
+      trailingStop:   { enabled: true,  trailPercent:   "1.5" },
+      atrExit:        { enabled: false, atrMultiplier:  "1.5" },
+      volumeGate:     { enabled: true,  minVolumeRatio: "1.2" },
+      signalReversal: { enabled: true,  reversalScore:  "-2"  },
+    },
   });
   const [activeTab, setActiveTab] = useState("provider");
   const [showSecrets, setShowSecrets] = useState({});
@@ -1136,6 +1166,7 @@ function SettingsModal({ creds, onSave, onClose }) {
       ? form.enabledCoins.filter(x => x !== c)
       : [...form.enabledCoins, c]);
   const setExitRule = (coin, rule) => set("exitRules", { ...form.exitRules, [coin]: rule });
+  const setExitStrategy = (key, patch) => set("exitStrategies", { ...form.exitStrategies, [key]: { ...form.exitStrategies[key], ...patch } });
   const toggleSecret = (field) => setShowSecrets(s => ({ ...s, [field]: !s[field] }));
 
   const activeProviderInfo = EXCHANGE_PROVIDERS[form.provider];
@@ -1279,16 +1310,31 @@ function SettingsModal({ creds, onSave, onClose }) {
         {/* ── Tab: Trading Rules ──────────────────────────────────────────── */}
         {activeTab === "trading" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
               <label style={{ fontSize: 12 }}>
-                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Trade size (USD per order)</div>
+                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Trade size (USD)</div>
                 <input type="number" value={form.tradeSizeUSD} onChange={e => set("tradeSizeUSD", e.target.value)}
                   min="1" max="10000" style={{ width: "100%", boxSizing: "border-box" }} />
               </label>
               <label style={{ fontSize: 12 }}>
-                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min signal confidence (%)</div>
+                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>Min confidence (%)</div>
                 <input type="number" value={form.minConfidence} onChange={e => set("minConfidence", e.target.value)}
                   min="50" max="99" style={{ width: "100%", boxSizing: "border-box" }} />
+              </label>
+              <label style={{ fontSize: 12 }}>
+                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>
+                  Trading fee (% per side)
+                  <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", display: "block", marginTop: 1 }}>
+                    Applied to both BUY and SELL
+                  </span>
+                </div>
+                <input type="number" value={form.feePercent} onChange={e => set("feePercent", e.target.value)}
+                  min="0" max="2" step="0.01" style={{ width: "100%", boxSizing: "border-box" }} />
+                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>
+                  {form.feePercent
+                    ? `Round-trip cost: ${(parseFloat(form.feePercent) * 2).toFixed(2)}% — need >${(parseFloat(form.feePercent) * 2).toFixed(2)}% gain to profit`
+                    : "0 = no fees (simulation)"}
+                </div>
               </label>
             </div>
 
@@ -1311,12 +1357,92 @@ function SettingsModal({ creds, onSave, onClose }) {
             </div>
 
             <div>
-              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, fontWeight: 600 }}>Exit rules (per coin)</div>
+              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, fontWeight: 600 }}>Exit rules — TP / SL (per coin)</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 {form.enabledCoins.map(c => (
                   <ExitRuleRow key={c} coin={c} rule={form.exitRules[c] || defaultExitRules[c]}
                     onChange={rule => setExitRule(c, rule)} color={COIN_COLORS[c]} />
                 ))}
+              </div>
+            </div>
+
+            {/* ── Exit Strategies ─────────────────────────────────────── */}
+            <div>
+              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10, fontWeight: 600 }}>
+                Exit strategies
+                <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", fontWeight: 400, marginLeft: 8 }}>
+                  Additional sell triggers — toggle each on/off
+                </span>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+
+                {/* Time-based exit */}
+                {[
+                  {
+                    key: "timeExit",
+                    label: "⏱ Time-based exit",
+                    desc: "Force sell if position not closed within N minutes",
+                    fields: [{ k: "maxHoldMinutes", label: "Max hold (min)", min: 1, max: 1440, step: 1, hint: "e.g. 30 min" }],
+                  },
+                  {
+                    key: "trailingStop",
+                    label: "📉 Trailing stop loss",
+                    desc: "Stop rises with price — locks in gains if price reverses",
+                    fields: [{ k: "trailPercent", label: "Trail (%)", min: 0.1, max: 20, step: 0.1, hint: "e.g. 1.5%" }],
+                  },
+                  {
+                    key: "atrExit",
+                    label: "📊 ATR-based exit",
+                    desc: "Scales TP/SL with recent volatility (ATR × multiplier)",
+                    fields: [{ k: "atrMultiplier", label: "ATR multiplier", min: 0.5, max: 5, step: 0.1, hint: "e.g. 1.5× ATR" }],
+                  },
+                  {
+                    key: "volumeGate",
+                    label: "📦 Volume gate on BUY",
+                    desc: "Only buy when volume ratio is above threshold",
+                    fields: [{ k: "minVolumeRatio", label: "Min vol ratio", min: 0.5, max: 5, step: 0.1, hint: "e.g. 1.2× average" }],
+                  },
+                  {
+                    key: "signalReversal",
+                    label: "🔄 Signal reversal exit",
+                    desc: "Sell if signal score drops below threshold while holding",
+                    fields: [{ k: "reversalScore", label: "Reversal score", min: -8, max: 0, step: 0.5, hint: "e.g. -2 triggers sell" }],
+                  },
+                ].map(({ key, label, desc, fields }) => {
+                  const s = form.exitStrategies[key] || {};
+                  const on = s.enabled;
+                  return (
+                    <div key={key} style={{ borderRadius: 8, border: `0.5px solid ${on ? "#6366f1" : "var(--color-border-tertiary)"}`, padding: "10px 12px", background: on ? "#6366f108" : "transparent" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: on ? 10 : 0 }}>
+                        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", flex: 1 }}>
+                          <input type="checkbox" checked={!!on} onChange={e => setExitStrategy(key, { enabled: e.target.checked })} />
+                          <div>
+                            <div style={{ fontSize: 12, fontWeight: 600, color: on ? "var(--color-text-primary)" : "var(--color-text-secondary)" }}>{label}</div>
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 1 }}>{desc}</div>
+                          </div>
+                        </label>
+                        <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, fontWeight: 600,
+                          background: on ? "#6366f122" : "var(--color-background-secondary)",
+                          color: on ? "#6366f1" : "var(--color-text-tertiary)" }}>
+                          {on ? "ON" : "OFF"}
+                        </span>
+                      </div>
+                      {on && (
+                        <div style={{ display: "flex", gap: 10 }}>
+                          {fields.map(f => (
+                            <label key={f.k} style={{ fontSize: 11, flex: 1 }}>
+                              <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>{f.label}</div>
+                              <input type="number" value={s[f.k] || ""} min={f.min} max={f.max} step={f.step}
+                                onChange={e => setExitStrategy(key, { [f.k]: e.target.value })}
+                                style={{ width: "100%", boxSizing: "border-box" }} />
+                              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>{f.hint}</div>
+                            </label>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -1349,9 +1475,10 @@ function CryptoAlgoTrader() {
   // Coinbase automation state
   const [creds, setCreds] = useState({
     provider: "coinbase",           // active exchange
-    tradeSizeUSD: "50",
+    tradeSizeUSD:  "50",
     minConfidence: "60",
-    enabledCoins: ["BTC"],
+    feePercent:    "0.1",   // default 0.10% per trade (Binance.US maker/taker)
+    enabledCoins:  ["BTC"],
     sandbox: false,
     keys: {                         // per-provider API credentials
       coinbase: { apiKeyName: "", privateKey: "" },
@@ -1365,6 +1492,13 @@ function CryptoAlgoTrader() {
       BTC: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
       ETH: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
       SOL: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
+    },
+    exitStrategies: {
+      timeExit:        { enabled: true,  maxHoldMinutes: "30" },
+      trailingStop:    { enabled: true,  trailPercent: "1.5"  },
+      atrExit:         { enabled: false, atrMultiplier: "1.5" },
+      volumeGate:      { enabled: true,  minVolumeRatio: "1.2" },
+      signalReversal:  { enabled: true,  reversalScore: "-2"  },
     },
   });
   const [autoEnabled, setAutoEnabled] = useState(false);
@@ -1402,6 +1536,8 @@ function CryptoAlgoTrader() {
   // Per-coin cooldown timestamp — no BUY within 1 minute of a confirmed SELL
   const cooldownRef = useRef({ BTC: null, ETH: null, SOL: null });
   const COOLDOWN_MS = 60_000; // 1 minute
+  // Per-coin trailing stop high-water mark (highest price since entry)
+  const trailingHighRef = useRef({ BTC: null, ETH: null, SOL: null });
   const [snapshot, setSnapshot] = useState(() => JSON.parse(JSON.stringify(stateRef.current)));
   const [news, setNews] = useState([]);
   const [activeSentiment, setActiveSentiment] = useState(0);
@@ -1839,8 +1975,9 @@ function CryptoAlgoTrader() {
       activeOrdersRef.current = {};
       pendingRef.current      = { BTC: null, ETH: null, SOL: null };
       orderErrorsRef.current  = { BTC: 0, ETH: 0, SOL: 0 };
-      cooldownRef.current     = { BTC: null, ETH: null, SOL: null };
-      tickRef.current         = 0;
+      cooldownRef.current      = { BTC: null, ETH: null, SOL: null };
+      trailingHighRef.current  = { BTC: null, ETH: null, SOL: null };
+      tickRef.current          = 0;
       liveStartRef.current    = Date.now();
       setSnapshot(JSON.parse(JSON.stringify(s)));
       setWarmingUp(true);
@@ -1884,7 +2021,7 @@ function CryptoAlgoTrader() {
       s.trades++;
       addAutoLog(`[MANUAL] BUY ${coin} @ $${price.toFixed(2)}`, "info");
     } else if (action === "SELL" && s.position) {
-      const profit = (price - s.position.price) * s.position.size;
+      const profit = calcProfit(s.position.price, price, s.position.size, creds.feePercent);
       const profitPct = s.position.price ? (price - s.position.price) / s.position.price * 100 : 0;
       s.pnl += profit;
       s.position = null;
@@ -1974,7 +2111,7 @@ function CryptoAlgoTrader() {
         // and the position was algo-owned, mark it as externally closed
         if (!exPos?.qty && localPos?.algoOwned) {
           const price  = s[coin].prices.at(-1);
-          const profit = localPos.price ? (price - localPos.price) * (localPos.size || 0) : 0;
+          const profit = localPos.price ? calcProfit(localPos.price, price, localPos.size || 0, creds.feePercent) : 0;
           const profitPct = localPos.price ? (price - localPos.price) / localPos.price * 100 : 0;
           s[coin].pnl += profit;
           s[coin].position = null;
@@ -2010,6 +2147,7 @@ function CryptoAlgoTrader() {
     pendingRef.current      = { BTC: null, ETH: null, SOL: null };
     orderErrorsRef.current  = { BTC: 0, ETH: 0, SOL: 0 };
     cooldownRef.current     = { BTC: null, ETH: null, SOL: null };
+    trailingHighRef.current = { BTC: null, ETH: null, SOL: null };
     addAutoLog("Live trading stopped", "warn");
   }, [addAutoLog]);
 
@@ -2064,32 +2202,86 @@ function CryptoAlgoTrader() {
 
       const signal = generateSignal(indicators, activeSentiment, volumeRatio);
 
-      // ── Compute take-profit and stop-loss levels from exit rules ─────────────
+      // ── Exit rule helpers ─────────────────────────────────────────────────────
       const exitRule = creds.exitRules?.[coin] || {};
+      const es       = creds.exitStrategies || {};
       const entryPrice = cs.position?.price || newPrice;
 
       const resolveLevel = (type, value, direction) => {
         const v = parseFloat(value) || 0;
         if (!v) return null;
-        if (type === "percent") {
-          return direction === "up"
-            ? entryPrice * (1 + v / 100)
-            : entryPrice * (1 - v / 100);
-        }
-        // absolute price target
-        return direction === "up" ? entryPrice + v : entryPrice - v;
+        return type === "percent"
+          ? direction === "up" ? entryPrice * (1 + v / 100) : entryPrice * (1 - v / 100)
+          : direction === "up" ? entryPrice + v : entryPrice - v;
       };
 
+      // ── 1. Standard TP / SL ───────────────────────────────────────────────────
       const takeProfitPrice = cs.position
         ? resolveLevel(exitRule.takeProfitType, exitRule.takeProfitValue, "up") : null;
       const stopLossPrice = cs.position
         ? resolveLevel(exitRule.stopLossType, exitRule.stopLossValue, "down") : null;
 
-      // ── Determine exit trigger ────────────────────────────────────────────────
       const hitTakeProfit = takeProfitPrice && newPrice >= takeProfitPrice;
       const hitStopLoss   = stopLossPrice   && newPrice <= stopLossPrice;
-      const shouldSell    = cs.position && (hitTakeProfit || hitStopLoss);
-      const sellReason    = hitTakeProfit ? "TAKE_PROFIT" : hitStopLoss ? "STOP_LOSS" : null;
+
+      // ── 2. Trailing stop ──────────────────────────────────────────────────────
+      let hitTrailingStop = false;
+      if (cs.position && es.trailingStop?.enabled) {
+        // Update high-water mark
+        if (!trailingHighRef.current[coin] || newPrice > trailingHighRef.current[coin]) {
+          trailingHighRef.current[coin] = newPrice;
+        }
+        const trailPct     = parseFloat(es.trailingStop.trailPercent) || 1.5;
+        const trailStopPx  = trailingHighRef.current[coin] * (1 - trailPct / 100);
+        if (newPrice <= trailStopPx && newPrice < trailingHighRef.current[coin] * 0.999) {
+          hitTrailingStop = true;
+        }
+      } else if (!cs.position) {
+        trailingHighRef.current[coin] = null; // reset when no position
+      }
+
+      // ── 3. ATR-based exit ─────────────────────────────────────────────────────
+      let hitATRStop = false, hitATRTP = false;
+      if (cs.position && es.atrExit?.enabled) {
+        const atr = calcATR(cs.prices, 14);
+        if (atr) {
+          const mult    = parseFloat(es.atrExit.atrMultiplier) || 1.5;
+          const atrTP   = entryPrice + atr * mult;
+          const atrSL   = entryPrice - atr * mult;
+          hitATRTP = newPrice >= atrTP;
+          hitATRStop = newPrice <= atrSL;
+        }
+      }
+
+      // ── 4. Time-based exit ────────────────────────────────────────────────────
+      let hitTimeExit = false;
+      if (cs.position && es.timeExit?.enabled) {
+        const maxMs   = (parseFloat(es.timeExit.maxHoldMinutes) || 30) * 60 * 1000;
+        const heldMs  = (tickRef.current - (cs.position.entryTick || 0)) * (speed || 1500);
+        if (heldMs >= maxMs) hitTimeExit = true;
+      }
+
+      // ── 5. Signal reversal exit ───────────────────────────────────────────────
+      let hitSignalReversal = false;
+      if (cs.position && es.signalReversal?.enabled) {
+        const threshold = parseFloat(es.signalReversal.reversalScore) || -2;
+        if (parseFloat(signal.score) <= threshold) hitSignalReversal = true;
+      }
+
+      // ── Combine all exit triggers ─────────────────────────────────────────────
+      const shouldSell = cs.position && (
+        hitTakeProfit || hitStopLoss ||
+        hitTrailingStop || hitATRTP || hitATRStop ||
+        hitTimeExit || hitSignalReversal
+      );
+      const sellReason = hitTakeProfit ? "TAKE_PROFIT"
+        : hitStopLoss       ? "STOP_LOSS"
+        : hitTrailingStop   ? "TRAILING_STOP"
+        : hitATRTP          ? "ATR_TAKE_PROFIT"
+        : hitATRStop        ? "ATR_STOP_LOSS"
+        : hitTimeExit       ? "TIME_EXIT"
+        : hitSignalReversal ? "SIGNAL_REVERSAL"
+        : null;
 
       // ── Warmup check (ref-based — never stale) ───────────────────────────────
       const inWarmup = liveStartRef.current !== null &&
@@ -2102,8 +2294,12 @@ function CryptoAlgoTrader() {
       // Cooling off: block BUY for 1 minute after a confirmed SELL
       const lastSell   = cooldownRef.current[coin];
       const inCooldown = lastSell !== null && (Date.now() - lastSell) < COOLDOWN_MS;
-      // Only buy if: BUY signal, no position, confidence ok, warmup done, no pending, not cooling off
-      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown) {
+      // ── Strategy 4: Volume gate on BUY ───────────────────────────────────────
+      const esV = creds.exitStrategies?.volumeGate;
+      const volumeOk = !esV?.enabled || volumeRatio >= (parseFloat(esV.minVolumeRatio) || 1.2);
+
+      // BUY gate: signal + confidence + warmup + no pending + cooldown + volume
+      if (signal.action === "BUY" && !cs.position && confPassed && !inWarmup && noPending && !inCooldown && volumeOk) {
         if (autoEnabled && creds.enabledCoins.includes(coin)) {
           // LIVE — log the signal and mark pending immediately
           addAutoLog(`🔔 BUY signal ${coin} @ $${newPrice.toFixed(2)} — conf ${signal.confidence}% score ${signal.score} — submitting order`, "info");
@@ -2159,9 +2355,11 @@ function CryptoAlgoTrader() {
           executeRealTrade(coin, "SELL", newPrice, 100, sellQty)
             .then(result => {
               if (result?.success) {
-                // Dollar P&L: (sellFillPrice - buyEntryPrice) * qty
+                // Fee-adjusted P&L: accounts for trading fees on both sides
                 const actualSellPrice = result.fillPrice || newPrice;
-                const profit = (actualSellPrice - posAtSell.price) * posAtSell.size;
+                const profit = calcProfit(posAtSell.price, actualSellPrice, posAtSell.size, creds.feePercent);
+                const feeCost = posAtSell.size * (actualSellPrice * parseFloat(creds.feePercent || 0) / 100 + posAtSell.price * parseFloat(creds.feePercent || 0) / 100);
+                addAutoLog(`💰 ${coin} P&L: $${profit >= 0 ? "+" : ""}${profit.toFixed(2)} (fees: ~$${feeCost.toFixed(2)})`, profit >= 0 ? "success" : "warn");
                 stateRef.current[coin].pnl    += profit;
                 stateRef.current[coin].trades++;
                 setSnapshot(JSON.parse(JSON.stringify(stateRef.current)));
@@ -2179,8 +2377,8 @@ function CryptoAlgoTrader() {
               pendingRef.current[coin] = null;
             });
         } else {
-          // SIMULATION — dollar P&L
-          const profit = (newPrice - cs.position.price) * cs.position.size;
+          // SIMULATION — fee-adjusted dollar P&L
+          const profit = calcProfit(cs.position.price, newPrice, cs.position.size, creds.feePercent);
           cs.pnl += profit;
           cs.position = null;
           cs.trades++;
@@ -2635,15 +2833,37 @@ function CryptoAlgoTrader() {
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Entry: <strong>${fmt(ep, 2)}</strong></div>
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Qty: <strong>{(coin.position.size || 0).toFixed(8)} {selectedCoin}</strong></div>
                 <div style={{ fontSize: 11, marginBottom: 3 }}>Now: <strong>${fmt(currentPrice, 2)}</strong></div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: unrealized >= 0 ? "#10b981" : "#ef4444", marginBottom: 6 }}>
-                  {fmtPct(unrealized)}{" ($"}{Math.abs(unrealizedDollar).toFixed(2)}{")"}
-                </div>
+                {(() => {
+                  const fee = parseFloat(creds.feePercent) || 0;
+                  const breakEven = ep * (1 + fee / 100) / (1 - fee / 100);
+                  const netPnl = calcProfit(ep, currentPrice, coin.position.size || 0, creds.feePercent);
+                  return (<>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: netPnl >= 0 ? "#10b981" : "#ef4444", marginBottom: 4 }}>
+                      {netPnl >= 0 ? "+" : ""}{"$"}{Math.abs(netPnl).toFixed(2)}{" ("}{fmtPct(unrealized)}{")"}
+                    </div>
+                    {fee > 0 && <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginBottom: 4 }}>
+                      Break-even (after fees): ${fmt(breakEven, 2)}
+                    </div>}
+                  </>);
+                })()}
                 {tp && <div style={{ fontSize: 10, color: "#10b981", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                   <span>↑ TP</span><strong>${fmt(tp, 2)}</strong>
                 </div>}
-                {sl && <div style={{ fontSize: 10, color: "#ef4444", display: "flex", justifyContent: "space-between" }}>
+                {sl && <div style={{ fontSize: 10, color: "#ef4444", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                   <span>↓ SL</span><strong>${fmt(sl, 2)}</strong>
                 </div>}
+                {creds.exitStrategies?.trailingStop?.enabled && trailingHighRef.current[selectedCoin] && (
+                  <div style={{ fontSize: 10, color: "#f59e0b", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                    <span>~ Trail stop</span>
+                    <strong>${fmt(trailingHighRef.current[selectedCoin] * (1 - (parseFloat(creds.exitStrategies.trailingStop.trailPercent) || 1.5) / 100), 2)}</strong>
+                  </div>
+                )}
+                {creds.exitStrategies?.timeExit?.enabled && coin.position && (
+                  <div style={{ fontSize: 10, color: "#a855f7", display: "flex", justifyContent: "space-between" }}>
+                    <span>⏱ Max hold</span>
+                    <strong>{creds.exitStrategies.timeExit.maxHoldMinutes}m</strong>
+                  </div>
+                )}
               </>);
             })() : (
               <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>No open position</div>
@@ -2814,11 +3034,16 @@ function CryptoAlgoTrader() {
               <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, padding: "4px 0", borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
                 <Badge action={h.action} />
                 {h.manual && <span style={{ fontSize: 10, background: "#fef3c7", color: "#92400e", padding: "1px 5px", borderRadius: 4, fontWeight: 600 }}>M</span>}
-                {h.exitTrigger === "TAKE_PROFIT" && <span style={{ fontSize: 10, background: "#d1fae5", color: "#065f46", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TP ↑</span>}
-                {h.exitTrigger === "STOP_LOSS"   && <span style={{ fontSize: 10, background: "#fee2e2", color: "#991b1b", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>SL ↓</span>}
+                {h.exitTrigger === "TAKE_PROFIT"     && <span style={{ fontSize: 10, background: "#d1fae5", color: "#065f46", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TP</span>}
+                {h.exitTrigger === "STOP_LOSS"        && <span style={{ fontSize: 10, background: "#fee2e2", color: "#991b1b", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>SL</span>}
+                {h.exitTrigger === "TRAILING_STOP"    && <span style={{ fontSize: 10, background: "#fef3c7", color: "#92400e", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TRL</span>}
+                {h.exitTrigger === "ATR_TAKE_PROFIT"  && <span style={{ fontSize: 10, background: "#d1fae5", color: "#065f46", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>ATR-TP</span>}
+                {h.exitTrigger === "ATR_STOP_LOSS"    && <span style={{ fontSize: 10, background: "#fee2e2", color: "#991b1b", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>ATR-SL</span>}
+                {h.exitTrigger === "TIME_EXIT"        && <span style={{ fontSize: 10, background: "#ede9fe", color: "#5b21b6", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>TIME</span>}
+                {h.exitTrigger === "SIGNAL_REVERSAL"  && <span style={{ fontSize: 10, background: "#fce7f3", color: "#9d174d", padding: "1px 6px", borderRadius: 4, fontWeight: 600 }}>REV</span>}
                 <span style={{ color: "var(--color-text-secondary)" }}>${fmt(h.price, selectedCoin === "BTC" ? 0 : 2)}</span>
                 <span style={{ marginLeft: "auto", color: "var(--color-text-tertiary)", fontSize: 10 }}>
-                  {h.manual ? "manual" : h.exitTrigger ? h.exitTrigger.replace("_", " ") : `conf ${h.confidence}%`}
+                  {h.manual ? "manual" : h.exitTrigger ? h.exitTrigger.toLowerCase().replace(/_/g, " ") : `conf ${h.confidence}%`}
                 </span>
               </div>
             ))}

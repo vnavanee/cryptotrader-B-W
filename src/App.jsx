@@ -1483,7 +1483,7 @@ function SettingsModal({ creds, onSave, onClose }) {
                     desc: "Sell if signal score drops below threshold while holding",
                     fields: [{ k: "reversalScore", label: "Reversal score", min: -8, max: 0, step: 0.5, hint: "e.g. -2 triggers sell" }],
                   },
-                ].map(({ key, label, desc, fields }) => {
+                ].map(({ key, label, desc, fields, extra }) => {
                   const s = form.exitStrategies[key] || {};
                   const on = s.enabled;
                   return (

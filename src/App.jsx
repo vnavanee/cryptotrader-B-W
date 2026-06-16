@@ -1196,6 +1196,12 @@ function SettingsModal({ creds, onSave, onClose }) {
       signalReversal: { enabled: true,  reversalScore:  "-2"  },
     },
     cooldownMinutes: creds.cooldownMinutes || "1",
+    sellOrderConfig: creds.sellOrderConfig || {
+      type: "market", limitOffsetType: "percent", limitOffsetValue: "0.1",
+      stopPricePct: "0.5", limitPricePct: "0.6",
+      ocoTpPct: "2", ocoSlPct: "1",
+      trailStopDelta: "1.5", trailDeltaType: "percent",
+    },
     indicatorConfig: creds.indicatorConfig || {
       rsi:       { enabled: true,  weight: "2",   oversold: "35",  overbought: "65" },
       sma_20_50: { enabled: true,  weight: "1.5", fast: "20",      slow: "50"       },
@@ -1220,6 +1226,7 @@ function SettingsModal({ creds, onSave, onClose }) {
   const setExitRule = (coin, rule) => set("exitRules", { ...form.exitRules, [coin]: rule });
   const setExitStrategy = (key, patch) => set("exitStrategies", { ...form.exitStrategies, [key]: { ...form.exitStrategies[key], ...patch } });
   const setIndicator    = (key, patch) => set("indicatorConfig",  { ...form.indicatorConfig,  [key]: { ...form.indicatorConfig[key],  ...patch } });
+  const setSellOrder    = (patch)       => set("sellOrderConfig",  { ...form.sellOrderConfig, ...patch });
   const toggleSecret = (field) => setShowSecrets(s => ({ ...s, [field]: !s[field] }));
 
   const activeProviderInfo = EXCHANGE_PROVIDERS[form.provider];
@@ -1542,6 +1549,142 @@ function SettingsModal({ creds, onSave, onClose }) {
               </div>
             </div>
 
+            {/* ── Sell order type ────────────────────────────────────── */}
+            <div>
+              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10, fontWeight: 600 }}>
+                Sell order type
+                <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", fontWeight: 400, marginLeft: 8 }}>
+                  How sell orders are placed on the exchange
+                </span>
+              </div>
+              {(() => {
+                const sc = form.sellOrderConfig;
+                const sel = (label, value, description) => (
+                  <div key={value} onClick={() => setSellOrder({ type: value })}
+                    style={{ padding: "10px 14px", borderRadius: 8, cursor: "pointer",
+                      border: `0.5px solid ${sc.type === value ? "#6366f1" : "var(--color-border-tertiary)"}`,
+                      background: sc.type === value ? "#6366f115" : "var(--color-background-secondary)",
+                      marginBottom: 6 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: sc.type === value ? "#6366f1" : "var(--color-text-primary)" }}>{label}</span>
+                      {sc.type === value && <span style={{ fontSize: 10, background: "#6366f122", color: "#6366f1", padding: "1px 8px", borderRadius: 4, fontWeight: 600 }}>SELECTED</span>}
+                    </div>
+                    <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>{description}</div>
+                  </div>
+                );
+                return (
+                  <div>
+                    {sel("Market", "market", "Sell immediately at the best available price. Fastest execution, no price guarantee.")}
+                    {sel("Limit", "limit", "Place a sell order at a specific price. Only fills if the market reaches that price.")}
+                    {sel("Stop-Limit", "stop_limit", "Trigger a limit sell when price drops to a stop level. Protects against sudden drops.")}
+                    {sel("OCO (One-Cancels-the-Other)", "oco", "Place a take-profit limit and a stop-loss simultaneously. Whichever fills first cancels the other.")}
+                    {sel("Trailing Stop (Exchange-native)", "trailing_stop", "Exchange manages a trailing stop. Price moves in your favour, stop follows at the delta.")}
+
+                    {/* Conditional parameter panels */}
+                    {sc.type === "limit" && (
+                      <div style={{ padding: "12px 14px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)", marginTop: 8 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--color-text-secondary)" }}>Limit price offset from signal price</div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                          <label style={{ fontSize: 11, flex: 1 }}>
+                            <div style={{ color: "var(--color-text-tertiary)", marginBottom: 3 }}>Offset type</div>
+                            <select value={sc.limitOffsetType} onChange={e => setSellOrder({ limitOffsetType: e.target.value })}
+                              style={{ width: "100%", fontSize: 11, padding: "4px 6px", borderRadius: 4, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                              <option value="percent">% below signal price</option>
+                              <option value="absolute">$ below signal price</option>
+                            </select>
+                          </label>
+                          <label style={{ fontSize: 11, flex: 1 }}>
+                            <div style={{ color: "var(--color-text-tertiary)", marginBottom: 3 }}>Offset value</div>
+                            <input type="number" value={sc.limitOffsetValue} min="0" step="0.01"
+                              onChange={e => setSellOrder({ limitOffsetValue: e.target.value })}
+                              style={{ width: "100%", boxSizing: "border-box" }} />
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                              {sc.limitOffsetType === "percent" ? `Limit = signal price × (1 - ${sc.limitOffsetValue}%)` : `Limit = signal price - $${sc.limitOffsetValue}`}
+                            </div>
+                          </label>
+                        </div>
+                      </div>
+                    )}
+
+                    {sc.type === "stop_limit" && (
+                      <div style={{ padding: "12px 14px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)", marginTop: 8 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--color-text-secondary)" }}>Stop-Limit parameters (% below entry price)</div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                          <label style={{ fontSize: 11, flex: 1 }}>
+                            <div style={{ color: "var(--color-text-tertiary)", marginBottom: 3 }}>Stop price (%)</div>
+                            <input type="number" value={sc.stopPricePct} min="0" max="50" step="0.1"
+                              onChange={e => setSellOrder({ stopPricePct: e.target.value })}
+                              style={{ width: "100%", boxSizing: "border-box" }} />
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>Triggers the limit order</div>
+                          </label>
+                          <label style={{ fontSize: 11, flex: 1 }}>
+                            <div style={{ color: "var(--color-text-tertiary)", marginBottom: 3 }}>Limit price (%)</div>
+                            <input type="number" value={sc.limitPricePct} min="0" max="50" step="0.1"
+                              onChange={e => setSellOrder({ limitPricePct: e.target.value })}
+                              style={{ width: "100%", boxSizing: "border-box" }} />
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>Must be lower than stop price</div>
+                          </label>
+                        </div>
+                      </div>
+                    )}
+
+                    {sc.type === "oco" && (
+                      <div style={{ padding: "12px 14px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)", marginTop: 8 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--color-text-secondary)" }}>OCO parameters (% from entry price)</div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                          <label style={{ fontSize: 11, flex: 1 }}>
+                            <div style={{ color: "#10b981", marginBottom: 3, fontWeight: 600 }}>↑ Take-profit (%)</div>
+                            <input type="number" value={sc.ocoTpPct} min="0.1" max="100" step="0.1"
+                              onChange={e => setSellOrder({ ocoTpPct: e.target.value })}
+                              style={{ width: "100%", boxSizing: "border-box" }} />
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>Limit sell above entry</div>
+                          </label>
+                          <label style={{ fontSize: 11, flex: 1 }}>
+                            <div style={{ color: "#ef4444", marginBottom: 3, fontWeight: 600 }}>↓ Stop-loss (%)</div>
+                            <input type="number" value={sc.ocoSlPct} min="0.1" max="50" step="0.1"
+                              onChange={e => setSellOrder({ ocoSlPct: e.target.value })}
+                              style={{ width: "100%", boxSizing: "border-box" }} />
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>Stop-limit sell below entry</div>
+                          </label>
+                        </div>
+                        <div style={{ fontSize: 10, color: "#f59e0b", marginTop: 8, padding: "6px 8px", background: "#fef3c711", borderRadius: 5, border: "0.5px solid #f59e0b" }}>
+                          OCO support varies by exchange. Binance.US supports OCO natively. Other exchanges may fall back to two separate orders.
+                        </div>
+                      </div>
+                    )}
+
+                    {sc.type === "trailing_stop" && (
+                      <div style={{ padding: "12px 14px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)", marginTop: 8 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 8, color: "var(--color-text-secondary)" }}>Exchange-native trailing stop parameters</div>
+                        <div style={{ display: "flex", gap: 10 }}>
+                          <label style={{ fontSize: 11, flex: 1 }}>
+                            <div style={{ color: "var(--color-text-tertiary)", marginBottom: 3 }}>Delta type</div>
+                            <select value={sc.trailDeltaType} onChange={e => setSellOrder({ trailDeltaType: e.target.value })}
+                              style={{ width: "100%", fontSize: 11, padding: "4px 6px", borderRadius: 4, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                              <option value="percent">% from peak</option>
+                              <option value="absolute">$ from peak</option>
+                            </select>
+                          </label>
+                          <label style={{ fontSize: 11, flex: 1 }}>
+                            <div style={{ color: "var(--color-text-tertiary)", marginBottom: 3 }}>Delta value</div>
+                            <input type="number" value={sc.trailStopDelta} min="0.01" step="0.01"
+                              onChange={e => setSellOrder({ trailStopDelta: e.target.value })}
+                              style={{ width: "100%", boxSizing: "border-box" }} />
+                            <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                              {sc.trailDeltaType === "absolute" ? `Stop follows $${sc.trailStopDelta} below peak` : `Stop follows ${sc.trailStopDelta}% below peak`}
+                            </div>
+                          </label>
+                        </div>
+                        <div style={{ fontSize: 10, color: "#f59e0b", marginTop: 8, padding: "6px 8px", background: "#fef3c711", borderRadius: 5, border: "0.5px solid #f59e0b" }}>
+                          Binance.US supports trailing stop orders natively. Other exchanges will simulate using the algo-managed trailing stop strategy above.
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
             {/* ── Indicator configuration ─────────────────────────────── */}
             <div>
               <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10, fontWeight: 600 }}>
@@ -1651,7 +1794,18 @@ function CryptoAlgoTrader() {
       volumeGate:      { enabled: true,  minVolumeRatio: "1.2" },
       signalReversal:  { enabled: true,  reversalScore:  "-2"  },
     },
-    cooldownMinutes: "1",           // configurable cool-off after a sell
+    cooldownMinutes: "1",
+    sellOrderConfig: {
+      type:               "market",   // market | limit | stop_limit | oco | trailing_stop
+      limitOffsetType:    "percent",  // percent | absolute
+      limitOffsetValue:   "0.1",      // % or $ below signal price for limit
+      stopPricePct:       "0.5",      // % below entry for stop-limit stop trigger
+      limitPricePct:      "0.6",      // % below entry for stop-limit limit price
+      ocoTpPct:           "2",        // OCO take-profit % above entry
+      ocoSlPct:           "1",        // OCO stop-loss % below entry
+      trailStopDelta:     "1.5",      // trailing stop % delta (exchange-native)
+      trailDeltaType:     "percent",  // percent | absolute
+    },
     indicatorConfig: {
       rsi:            { enabled: true,  weight: "2",   oversold: "35",  overbought: "65" },
       sma_20_50:      { enabled: true,  weight: "1.5", fast: "20",     slow: "50"  },
@@ -2000,19 +2154,57 @@ function CryptoAlgoTrader() {
 
       if (!PROXY_BASE) throw new Error("No proxy URL — set PROXY_BASE to your Cloud Run function URL");
 
-      // Route order through proxy to avoid CORS — keys sent over HTTPS, never stored
-      const res = await fetch(`${PROXY_BASE}/order`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          exchange:   creds.provider,
-          coin,
-          side:       action,
-          quoteSize:  tradeUSD,
-          baseSize,
-          ...keys,
-        }),
-      });
+      // For SELL orders — use advanced order type if configured
+      const sellCfg = creds.sellOrderConfig;
+      const useAdvancedSell = action === "SELL" && sellCfg?.type && sellCfg.type !== "market";
+
+      let res;
+      if (useAdvancedSell) {
+        // Try exchange-native advanced order (limit / stop-limit / OCO / trailing)
+        res = await fetch(`${PROXY_BASE}/advancedsell`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            exchange:     creds.provider,
+            coin,
+            qty:          baseSize,
+            currentPrice: price,
+            sellConfig:   sellCfg,
+            ...keys,
+          }),
+        });
+        const advData = await res.json();
+        if (advData.fallback) {
+          // Exchange doesn't support this natively — fall through to market
+          addAutoLog(`⚠ ${sellCfg.type} not supported on ${providerName} — falling back to market sell`, "warn");
+          res = await fetch(`${PROXY_BASE}/order`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ exchange: creds.provider, coin, side: action, quoteSize: tradeUSD, baseSize, ...keys }),
+          });
+        } else {
+          const data = await (res.json().catch(() => advData));
+          if (!res.ok && !advData.fallback) throw new Error(advData.error || `HTTP ${res.status}`);
+          const orderTypeLabel = sellCfg.type.replace(/_/g, " ").toUpperCase();
+          addAutoLog(`✓ [${providerName}] ${orderTypeLabel} SELL ${coin} placed — ID: ${advData.orderId?.slice(0,12)}...`, "info");
+          orderErrorsRef.current[coin] = 0;
+          await fetchBalances();
+          return { success: true, orderId: advData.orderId, fillPrice: price, filledQty: baseSize };
+        }
+      } else {
+        res = await fetch(`${PROXY_BASE}/order`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            exchange:   creds.provider,
+            coin,
+            side:       action,
+            quoteSize:  tradeUSD,
+            baseSize,
+            ...keys,
+          }),
+        });
+      }
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
@@ -3037,6 +3229,13 @@ function CryptoAlgoTrader() {
                     })()}</strong>
                   </div>
                 )}
+                {/* Active sell order type badge */}
+                {autoEnabled && creds.sellOrderConfig?.type && (
+                  <div style={{ fontSize: 10, marginTop: 4, color: "#6366f1", display: "flex", justifyContent: "space-between" }}>
+                    <span>Sell type</span>
+                    <strong style={{ textTransform: "uppercase" }}>{(creds.sellOrderConfig.type || "market").replace(/_/g," ")}</strong>
+                  </div>
+                )}
                 {creds.exitStrategies?.timeExit?.enabled && coin.position && (
                   <div style={{ fontSize: 10, color: "#a855f7", display: "flex", justifyContent: "space-between" }}>
                     <span>⏱ Max hold</span>
@@ -3266,4 +3465,5 @@ export default function App() {
     </ErrorBoundary>
   );
 }
+
 

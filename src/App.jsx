@@ -222,53 +222,94 @@ function calcATR(prices, period = 14) {
   return trueRanges.reduce((a, b) => a + b, 0) / period;
 }
 
-function generateSignal(indicators, newsSentiment, volumeRatio) {
+function generateSignal(indicators, newsSentiment, volumeRatio, indicatorConfig = null) {
+  const ic = indicatorConfig || {};
+  const cfg = (key, defaults = {}) => ({ enabled: true, ...defaults, ...ic[key] });
   // Each entry: { weight, vote: +1 bull | -1 bear | 0 neutral, reason, active }
   const signals = [];
 
-  // ── RSI (weight 2) ────────────────────────────────────────────────────────
-  if (indicators.rsi !== null) {
-    if (indicators.rsi < 35)
-      signals.push({ weight: 2, vote: 1,  label: `RSI oversold (${indicators.rsi.toFixed(1)})`, active: true });
-    else if (indicators.rsi > 65)
-      signals.push({ weight: 2, vote: -1, label: `RSI overbought (${indicators.rsi.toFixed(1)})`, active: true });
+  // ── RSI ──────────────────────────────────────────────────────────────────
+  const rsiCfg = cfg("rsi", { weight: 2, oversold: 35, overbought: 65 });
+  if (rsiCfg.enabled && indicators.rsi !== null) {
+    const w = parseFloat(rsiCfg.weight) || 2;
+    const os = parseFloat(rsiCfg.oversold) || 35;
+    const ob = parseFloat(rsiCfg.overbought) || 65;
+    if (indicators.rsi < os)
+      signals.push({ weight: w, vote: 1,  label: `RSI oversold (${indicators.rsi.toFixed(1)} < ${os})` });
+    else if (indicators.rsi > ob)
+      signals.push({ weight: w, vote: -1, label: `RSI overbought (${indicators.rsi.toFixed(1)} > ${ob})` });
     else
-      signals.push({ weight: 2, vote: 0,  label: `RSI neutral (${indicators.rsi.toFixed(1)})`, active: true });
+      signals.push({ weight: w, vote: 0,  label: `RSI neutral (${indicators.rsi.toFixed(1)})` });
   }
 
-  // ── SMA crossover (weight 1.5) ────────────────────────────────────────────
-  if (indicators.sma20 && indicators.sma50) {
-    if (indicators.sma20 > indicators.sma50)
-      signals.push({ weight: 1.5, vote: 1,  label: "SMA20 > SMA50 (bullish cross)", active: true });
-    else
-      signals.push({ weight: 1.5, vote: -1, label: "SMA20 < SMA50 (bearish cross)", active: true });
+  // ── SMA 20/50 ────────────────────────────────────────────────────────────
+  const sma2050 = cfg("sma_20_50", { weight: 1.5 });
+  if (sma2050.enabled && indicators.sma20 && indicators.sma50) {
+    const w = parseFloat(sma2050.weight) || 1.5;
+    signals.push(indicators.sma20 > indicators.sma50
+      ? { weight: w, vote: 1,  label: `SMA20 > SMA50 (${indicators.sma20.toFixed(0)} > ${indicators.sma50.toFixed(0)})` }
+      : { weight: w, vote: -1, label: `SMA20 < SMA50 (${indicators.sma20.toFixed(0)} < ${indicators.sma50.toFixed(0)})` });
   }
 
-  // ── MACD (weight 1) ───────────────────────────────────────────────────────
-  if (indicators.macd !== null) {
-    if (indicators.macd > 0)
-      signals.push({ weight: 1, vote: 1,  label: `MACD positive (${indicators.macd.toFixed(2)})`, active: true });
-    else
-      signals.push({ weight: 1, vote: -1, label: `MACD negative (${indicators.macd.toFixed(2)})`, active: true });
+  // ── SMA 20/99 ────────────────────────────────────────────────────────────
+  const sma2099 = cfg("sma_20_99", { weight: 2 });
+  if (sma2099.enabled && indicators.sma20 && indicators.sma99) {
+    const w = parseFloat(sma2099.weight) || 2;
+    signals.push(indicators.sma20 > indicators.sma99
+      ? { weight: w, vote: 1,  label: `SMA20 > SMA99 (${indicators.sma20.toFixed(0)} > ${indicators.sma99.toFixed(0)})` }
+      : { weight: w, vote: -1, label: `SMA20 < SMA99 (${indicators.sma20.toFixed(0)} < ${indicators.sma99.toFixed(0)})` });
   }
 
-  // ── Bollinger Bands (weight 2) ────────────────────────────────────────────
-  if (indicators.boll && indicators.currentPrice) {
+  // ── SMA 50/99 ────────────────────────────────────────────────────────────
+  const sma5099 = cfg("sma_50_99", { weight: 1.5 });
+  if (sma5099.enabled && indicators.sma50 && indicators.sma99) {
+    const w = parseFloat(sma5099.weight) || 1.5;
+    signals.push(indicators.sma50 > indicators.sma99
+      ? { weight: w, vote: 1,  label: `SMA50 > SMA99 (${indicators.sma50.toFixed(0)} > ${indicators.sma99.toFixed(0)})` }
+      : { weight: w, vote: -1, label: `SMA50 < SMA99 (${indicators.sma50.toFixed(0)} < ${indicators.sma99.toFixed(0)})` });
+  }
+
+  // ── EMA 12/26 ────────────────────────────────────────────────────────────
+  const ema1226 = cfg("ema_12_26", { weight: 1.5 });
+  if (ema1226.enabled && indicators.ema12 && indicators.ema26) {
+    const w = parseFloat(ema1226.weight) || 1.5;
+    signals.push(indicators.ema12 > indicators.ema26
+      ? { weight: w, vote: 1,  label: `EMA12 > EMA26 (${indicators.ema12.toFixed(0)} > ${indicators.ema26.toFixed(0)})` }
+      : { weight: w, vote: -1, label: `EMA12 < EMA26 (${indicators.ema12.toFixed(0)} < ${indicators.ema26.toFixed(0)})` });
+  }
+
+  // ── MACD ──────────────────────────────────────────────────────────────────
+  const macdCfg = cfg("macd", { weight: 1 });
+  if (macdCfg.enabled && indicators.macd !== null) {
+    const w = parseFloat(macdCfg.weight) || 1;
+    signals.push(indicators.macd > 0
+      ? { weight: w, vote: 1,  label: `MACD positive (${indicators.macd.toFixed(2)})` }
+      : { weight: w, vote: -1, label: `MACD negative (${indicators.macd.toFixed(2)})` });
+  }
+
+  // ── Bollinger Bands ───────────────────────────────────────────────────────
+  const bollCfg = cfg("bollinger", { weight: 2 });
+  if (bollCfg.enabled && indicators.boll && indicators.currentPrice) {
+    const w = parseFloat(bollCfg.weight) || 2;
     if (indicators.currentPrice < indicators.boll.lower)
-      signals.push({ weight: 2, vote: 1,  label: "Price below BB lower band", active: true });
+      signals.push({ weight: w, vote: 1,  label: `Price below BB lower band (${indicators.boll.lower.toFixed(0)})` });
     else if (indicators.currentPrice > indicators.boll.upper)
-      signals.push({ weight: 2, vote: -1, label: "Price above BB upper band", active: true });
+      signals.push({ weight: w, vote: -1, label: `Price above BB upper band (${indicators.boll.upper.toFixed(0)})` });
     else
-      signals.push({ weight: 2, vote: 0,  label: "Price inside BB bands", active: true });
+      signals.push({ weight: w, vote: 0,  label: "Price inside BB bands" });
   }
 
-  // ── News sentiment (weight 1.5) ───────────────────────────────────────────
-  if (newsSentiment > 0.15)
-    signals.push({ weight: 1.5, vote: 1,  label: `Positive news sentiment (${(newsSentiment * 100).toFixed(0)}%)`, active: true });
-  else if (newsSentiment < -0.15)
-    signals.push({ weight: 1.5, vote: -1, label: `Negative news sentiment (${(newsSentiment * 100).toFixed(0)}%)`, active: true });
-  else
-    signals.push({ weight: 1.5, vote: 0,  label: `Neutral news (${(newsSentiment * 100).toFixed(0)}%)`, active: true });
+  // ── News sentiment ────────────────────────────────────────────────────────
+  const newsCfg = cfg("news", { weight: 1.5 });
+  if (newsCfg.enabled) {
+    const w = parseFloat(newsCfg.weight) || 1.5;
+    if (newsSentiment > 0.15)
+      signals.push({ weight: w, vote: 1,  label: `Positive news (${(newsSentiment * 100).toFixed(0)}%)` });
+    else if (newsSentiment < -0.15)
+      signals.push({ weight: w, vote: -1, label: `Negative news (${(newsSentiment * 100).toFixed(0)}%)` });
+    else
+      signals.push({ weight: w, vote: 0,  label: `Neutral news (${(newsSentiment * 100).toFixed(0)}%)` });
+  }
 
   // ── Weighted score ────────────────────────────────────────────────────────
   let score = signals.reduce((sum, s) => sum + s.vote * s.weight, 0);
@@ -1149,10 +1190,21 @@ function SettingsModal({ creds, onSave, onClose }) {
     exitRules:     creds.exitRules || defaultExitRules,
     exitStrategies: creds.exitStrategies || {
       timeExit:       { enabled: true,  maxHoldMinutes: "30"  },
-      trailingStop:   { enabled: true,  trailPercent:   "1.5" },
+      trailingStop:   { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" },
       atrExit:        { enabled: false, atrMultiplier:  "1.5" },
       volumeGate:     { enabled: true,  minVolumeRatio: "1.2" },
       signalReversal: { enabled: true,  reversalScore:  "-2"  },
+    },
+    cooldownMinutes: creds.cooldownMinutes || "1",
+    indicatorConfig: creds.indicatorConfig || {
+      rsi:       { enabled: true,  weight: "2",   oversold: "35",  overbought: "65" },
+      sma_20_50: { enabled: true,  weight: "1.5", fast: "20",      slow: "50"       },
+      sma_20_99: { enabled: false, weight: "2",   fast: "20",      slow: "99"       },
+      sma_50_99: { enabled: false, weight: "1.5", fast: "50",      slow: "99"       },
+      ema_12_26: { enabled: false, weight: "1.5", fast: "12",      slow: "26"       },
+      macd:      { enabled: true,  weight: "1"                                      },
+      bollinger: { enabled: true,  weight: "2",   period: "20"                      },
+      news:      { enabled: true,  weight: "1.5"                                    },
     },
   });
   const [activeTab, setActiveTab] = useState("provider");
@@ -1167,6 +1219,7 @@ function SettingsModal({ creds, onSave, onClose }) {
       : [...form.enabledCoins, c]);
   const setExitRule = (coin, rule) => set("exitRules", { ...form.exitRules, [coin]: rule });
   const setExitStrategy = (key, patch) => set("exitStrategies", { ...form.exitStrategies, [key]: { ...form.exitStrategies[key], ...patch } });
+  const setIndicator    = (key, patch) => set("indicatorConfig",  { ...form.indicatorConfig,  [key]: { ...form.indicatorConfig[key],  ...patch } });
   const toggleSecret = (field) => setShowSecrets(s => ({ ...s, [field]: !s[field] }));
 
   const activeProviderInfo = EXCHANGE_PROVIDERS[form.provider];
@@ -1338,6 +1391,27 @@ function SettingsModal({ creds, onSave, onClose }) {
               </label>
             </div>
 
+            {/* ── Cooldown period ─────────────────────────────────────── */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, alignItems: "start" }}>
+              <label style={{ fontSize: 12 }}>
+                <div style={{ color: "var(--color-text-secondary)", marginBottom: 5 }}>
+                  Cool-off after sell (min)
+                  <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", display: "block", marginTop: 1 }}>
+                    No BUY signal for N minutes after a sell
+                  </span>
+                </div>
+                <input type="number" value={form.cooldownMinutes} onChange={e => set("cooldownMinutes", e.target.value)}
+                  min="0" max="60" step="0.5" style={{ width: "100%", boxSizing: "border-box" }} />
+                <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 3 }}>
+                  {form.cooldownMinutes === "0" ? "No cooldown" : `${form.cooldownMinutes} min cool-off`}
+                </div>
+              </label>
+              <div style={{ padding: "8px 12px", borderRadius: 7, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-tertiary)", fontSize: 11, color: "var(--color-text-secondary)", lineHeight: 1.6 }}>
+                Cool-off prevents immediately re-entering a trade right after a stop-loss or time exit,
+                giving the market time to stabilise. Set to 0 to disable.
+              </div>
+            </div>
+
             <div>
               <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, fontWeight: 600 }}>Active trading pairs</div>
               <div style={{ display: "flex", gap: 8 }}>
@@ -1388,7 +1462,8 @@ function SettingsModal({ creds, onSave, onClose }) {
                     key: "trailingStop",
                     label: "📉 Trailing stop loss",
                     desc: "Stop rises with price — locks in gains if price reverses",
-                    fields: [{ k: "trailPercent", label: "Trail (%)", min: 0.1, max: 20, step: 0.1, hint: "e.g. 1.5%" }],
+                    fields: [{ k: "trailPercent", label: "Trail amount", min: 0.1, max: 20000, step: 0.1, hint: "% or $ depending on delta type" }],
+                    extra: "trailDelta",
                   },
                   {
                     key: "atrExit",
@@ -1428,14 +1503,35 @@ function SettingsModal({ creds, onSave, onClose }) {
                         </span>
                       </div>
                       {on && (
-                        <div style={{ display: "flex", gap: 10 }}>
+                        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                          {/* Delta type selector for trailing stop */}
+                          {extra === "trailDelta" && (
+                            <label style={{ fontSize: 11 }}>
+                              <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>Delta type</div>
+                              <select value={s.trailDelta || "percent"}
+                                onChange={e => setExitStrategy(key, { trailDelta: e.target.value })}
+                                style={{ fontSize: 11, padding: "3px 6px", borderRadius: 4, border: "0.5px solid var(--color-border-secondary)", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
+                                <option value="percent">% (relative)</option>
+                                <option value="absolute">$ (absolute)</option>
+                              </select>
+                              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                                {s.trailDelta === "absolute" ? "$ below peak price" : "% below peak price"}
+                              </div>
+                            </label>
+                          )}
                           {fields.map(f => (
-                            <label key={f.k} style={{ fontSize: 11, flex: 1 }}>
-                              <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>{f.label}</div>
+                            <label key={f.k} style={{ fontSize: 11, flex: 1, minWidth: 100 }}>
+                              <div style={{ color: "var(--color-text-secondary)", marginBottom: 3 }}>
+                                {f.label}{extra === "trailDelta" ? (s.trailDelta === "absolute" ? " ($)" : " (%)") : ""}
+                              </div>
                               <input type="number" value={s[f.k] || ""} min={f.min} max={f.max} step={f.step}
                                 onChange={e => setExitStrategy(key, { [f.k]: e.target.value })}
                                 style={{ width: "100%", boxSizing: "border-box" }} />
-                              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>{f.hint}</div>
+                              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
+                                {extra === "trailDelta" && s.trailDelta === "absolute"
+                                  ? `Sell when price drops $${s[f.k] || "0"} below peak`
+                                  : f.hint}
+                              </div>
                             </label>
                           ))}
                         </div>
@@ -1445,6 +1541,61 @@ function SettingsModal({ creds, onSave, onClose }) {
                 })}
               </div>
             </div>
+
+            {/* ── Indicator configuration ─────────────────────────────── */}
+            <div>
+              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 10, fontWeight: 600 }}>
+                Buy signal indicators
+                <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", fontWeight: 400, marginLeft: 8 }}>
+                  Toggle indicators and adjust weights / parameters
+                </span>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {[
+                  { key: "rsi",       label: "RSI",              color: "#a855f7", params: [{ k: "oversold", label: "Oversold", min: 10, max: 50 }, { k: "overbought", label: "Overbought", min: 50, max: 90 }] },
+                  { key: "sma_20_50", label: "SMA 20 / 50",      color: "#f59e0b", params: [] },
+                  { key: "sma_20_99", label: "SMA 20 / 99",      color: "#f59e0b", params: [] },
+                  { key: "sma_50_99", label: "SMA 50 / 99",      color: "#f59e0b", params: [] },
+                  { key: "ema_12_26", label: "EMA 12 / 26",      color: "#06b6d4", params: [] },
+                  { key: "macd",      label: "MACD",             color: "#10b981", params: [] },
+                  { key: "bollinger", label: "Bollinger Bands",  color: "#6366f1", params: [{ k: "period", label: "Period", min: 5, max: 50 }] },
+                  { key: "news",      label: "News sentiment",   color: "#ec4899", params: [] },
+                ].map(({ key, label, color, params }) => {
+                  const ic = form.indicatorConfig[key] || {};
+                  const on = ic.enabled;
+                  return (
+                    <div key={key} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 7,
+                      border: `0.5px solid ${on ? color + "66" : "var(--color-border-tertiary)"}`,
+                      background: on ? color + "08" : "transparent" }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", minWidth: 140 }}>
+                        <input type="checkbox" checked={!!on} onChange={e => setIndicator(key, { enabled: e.target.checked })} />
+                        <span style={{ fontSize: 12, fontWeight: 600, color: on ? color : "var(--color-text-secondary)" }}>{label}</span>
+                      </label>
+                      {on && (
+                        <>
+                          <label style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4 }}>
+                            <span style={{ color: "var(--color-text-tertiary)" }}>Weight</span>
+                            <input type="number" value={ic.weight || "1"} min="0.1" max="5" step="0.1"
+                              onChange={e => setIndicator(key, { weight: e.target.value })}
+                              style={{ width: 52, fontSize: 11, padding: "2px 4px", boxSizing: "border-box" }} />
+                          </label>
+                          {params.map(p => (
+                            <label key={p.k} style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4 }}>
+                              <span style={{ color: "var(--color-text-tertiary)" }}>{p.label}</span>
+                              <input type="number" value={ic[p.k] || ""} min={p.min} max={p.max} step="1"
+                                onChange={e => setIndicator(key, { [p.k]: e.target.value })}
+                                style={{ width: 48, fontSize: 11, padding: "2px 4px", boxSizing: "border-box" }} />
+                            </label>
+                          ))}
+                        </>
+                      )}
+                      {!on && <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", marginLeft: 4 }}>disabled</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
           </div>
         )}
 
@@ -1494,11 +1645,22 @@ function CryptoAlgoTrader() {
       SOL: { takeProfitType: "percent", takeProfitValue: "2", stopLossType: "percent", stopLossValue: "1" },
     },
     exitStrategies: {
-      timeExit:        { enabled: true,  maxHoldMinutes: "30" },
-      trailingStop:    { enabled: true,  trailPercent: "1.5"  },
-      atrExit:         { enabled: false, atrMultiplier: "1.5" },
+      timeExit:        { enabled: true,  maxHoldMinutes: "30"  },
+      trailingStop:    { enabled: true,  trailPercent:   "1.5", trailDelta: "absolute" }, // "absolute"=$, "percent"=%
+      atrExit:         { enabled: false, atrMultiplier:  "1.5" },
       volumeGate:      { enabled: true,  minVolumeRatio: "1.2" },
-      signalReversal:  { enabled: true,  reversalScore: "-2"  },
+      signalReversal:  { enabled: true,  reversalScore:  "-2"  },
+    },
+    cooldownMinutes: "1",           // configurable cool-off after a sell
+    indicatorConfig: {
+      rsi:            { enabled: true,  weight: "2",   oversold: "35",  overbought: "65" },
+      sma_20_50:      { enabled: true,  weight: "1.5", fast: "20",     slow: "50"  },
+      sma_20_99:      { enabled: false, weight: "2",   fast: "20",     slow: "99"  },
+      sma_50_99:      { enabled: false, weight: "1.5", fast: "50",     slow: "99"  },
+      ema_12_26:      { enabled: false, weight: "1.5", fast: "12",     slow: "26"  },
+      macd:           { enabled: true,  weight: "1"   },
+      bollinger:      { enabled: true,  weight: "2",   period: "20"  },
+      news:           { enabled: true,  weight: "1.5" },
     },
   });
   const [autoEnabled, setAutoEnabled] = useState(false);
@@ -1535,7 +1697,7 @@ function CryptoAlgoTrader() {
   const MAX_ORDER_ERRORS = 3;
   // Per-coin cooldown timestamp — no BUY within 1 minute of a confirmed SELL
   const cooldownRef = useRef({ BTC: null, ETH: null, SOL: null });
-  const COOLDOWN_MS = 60_000; // 1 minute
+  const COOLDOWN_MS = 60_000; // default — overridden per-tick by creds.cooldownMinutes
   // Per-coin trailing stop high-water mark (highest price since entry)
   const trailingHighRef = useRef({ BTC: null, ETH: null, SOL: null });
   const [snapshot, setSnapshot] = useState(() => JSON.parse(JSON.stringify(stateRef.current)));
@@ -2191,16 +2353,20 @@ function CryptoAlgoTrader() {
       const avgVol = cs.volumes.slice(-20).reduce((a, b) => a + b, 0) / Math.min(cs.volumes.length, 20);
       const volumeRatio = (cs.volumes[cs.volumes.length - 1] || 1) / avgVol;
 
+      const bollPeriod = parseInt(creds.indicatorConfig?.bollinger?.period) || 20;
       const indicators = {
         currentPrice: newPrice,
-        sma20: calcSMA(cs.prices, 20),
-        sma50: calcSMA(cs.prices, 50),
-        rsi: calcRSI(cs.prices, 14),
-        boll: calcBollinger(cs.prices, 20),
-        macd: calcMACD(cs.prices),
+        sma20:  calcSMA(cs.prices, 20),
+        sma50:  calcSMA(cs.prices, 50),
+        sma99:  calcSMA(cs.prices, 99),
+        ema12:  calcEMA(cs.prices, 12),
+        ema26:  calcEMA(cs.prices, 26),
+        rsi:    calcRSI(cs.prices, 14),
+        boll:   calcBollinger(cs.prices, bollPeriod),
+        macd:   calcMACD(cs.prices),
       };
 
-      const signal = generateSignal(indicators, activeSentiment, volumeRatio);
+      const signal = generateSignal(indicators, activeSentiment, volumeRatio, creds.indicatorConfig);
 
       // ── Exit rule helpers ─────────────────────────────────────────────────────
       const exitRule = creds.exitRules?.[coin] || {};
@@ -2231,13 +2397,18 @@ function CryptoAlgoTrader() {
         if (!trailingHighRef.current[coin] || newPrice > trailingHighRef.current[coin]) {
           trailingHighRef.current[coin] = newPrice;
         }
-        const trailPct     = parseFloat(es.trailingStop.trailPercent) || 1.5;
-        const trailStopPx  = trailingHighRef.current[coin] * (1 - trailPct / 100);
-        if (newPrice <= trailStopPx && newPrice < trailingHighRef.current[coin] * 0.999) {
+        const trailVal  = parseFloat(es.trailingStop.trailPercent) || 1.5;
+        const deltaType = es.trailingStop.trailDelta || "percent";
+        const peak      = trailingHighRef.current[coin];
+        // Compute stop price based on delta type
+        const trailStopPx = deltaType === "absolute"
+          ? peak - trailVal                    // e.g. peak - $500
+          : peak * (1 - trailVal / 100);       // e.g. peak * (1 - 1.5%)
+        if (newPrice <= trailStopPx && newPrice < peak * 0.999) {
           hitTrailingStop = true;
         }
       } else if (!cs.position) {
-        trailingHighRef.current[coin] = null; // reset when no position
+        trailingHighRef.current[coin] = null;
       }
 
       // ── 3. ATR-based exit ─────────────────────────────────────────────────────
@@ -2293,7 +2464,8 @@ function CryptoAlgoTrader() {
       const noPending  = !pendingRef.current[coin]; // no order already in flight
       // Cooling off: block BUY for 1 minute after a confirmed SELL
       const lastSell   = cooldownRef.current[coin];
-      const inCooldown = lastSell !== null && (Date.now() - lastSell) < COOLDOWN_MS;
+      const cooldownMs = (parseFloat(creds.cooldownMinutes) || 1) * 60_000;
+      const inCooldown = lastSell !== null && (Date.now() - lastSell) < cooldownMs;
       // ── Strategy 4: Volume gate on BUY ───────────────────────────────────────
       const esV = creds.exitStrategies?.volumeGate;
       const volumeOk = !esV?.enabled || volumeRatio >= (parseFloat(esV.minVolumeRatio) || 1.2);
@@ -2855,7 +3027,14 @@ function CryptoAlgoTrader() {
                 {creds.exitStrategies?.trailingStop?.enabled && trailingHighRef.current[selectedCoin] && (
                   <div style={{ fontSize: 10, color: "#f59e0b", display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                     <span>~ Trail stop</span>
-                    <strong>${fmt(trailingHighRef.current[selectedCoin] * (1 - (parseFloat(creds.exitStrategies.trailingStop.trailPercent) || 1.5) / 100), 2)}</strong>
+                <strong>{(() => {
+                      const ts   = creds.exitStrategies?.trailingStop || {};
+                      const peak = trailingHighRef.current[selectedCoin];
+                      if (!peak) return "—";
+                      const val  = parseFloat(ts.trailPercent) || 1.5;
+                      const stop = ts.trailDelta === "absolute" ? peak - val : peak * (1 - val / 100);
+                      return "$" + fmt(stop, 2);
+                    })()}</strong>
                   </div>
                 )}
                 {creds.exitStrategies?.timeExit?.enabled && coin.position && (
